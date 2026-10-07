@@ -231,8 +231,17 @@ pub fn decide(
         s is Retry ==> s->Retry_0 <= rule.max_wait_ms,
         // A write call never repeats after a 5xx or a network error.
         s is Retry ==> spec_retryable(outcome, idempotent),
-        // Success and client errors end the call.
+        // Success and client errors end the call. Only they give Done.
         (outcome is Success || outcome is ClientError) ==> s is Done,
+        s is Done ==> (outcome is Success || outcome is ClientError),
+        // A read call with attempts left retries a 5xx or network error
+        // after exactly the capped backoff.
+        ((outcome is ServerError || outcome is NetworkError) && idempotent
+            && attempt < rule.max_attempts) ==> s == Step::Retry(spec_backoff(
+            rule.initial_backoff_ms as int,
+            attempt as int,
+            rule.max_wait_ms as int,
+        ) as u64),
         // A 429 with a wait in the cap and attempts left always retries.
         (outcome is RateLimited && attempt < rule.max_attempts && (match retry_after_ms {
             Some(w) => w <= rule.max_wait_ms,
@@ -259,8 +268,7 @@ pub fn decide(
         },
         Outcome::ServerError | Outcome::NetworkError => {
             if idempotent && attempt < rule.max_attempts {
-                let b = backoff_ms(rule.initial_backoff_ms, attempt, rule.max_wait_ms);
-                Step::Retry(b)
+                Step::Retry(backoff_ms(rule.initial_backoff_ms, attempt, rule.max_wait_ms))
             } else {
                 Step::GiveUp
             }
@@ -281,8 +289,9 @@ pub fn retry_after_ms(secs: u64) -> (r: u64)
     }
 }
 
-/// A call stops after at most `max_attempts` attempts: the attempt counter
-/// starts at 1 and each `Retry` adds 1, and `Retry` needs `attempt < max`.
+/// One step of the client loop: a retry at `attempt < max` gives a next
+/// attempt that is still `<= max`. The loop itself (start at 1, add 1 per
+/// retry) is in `src/client.rs`. This spec does not include it. Tests check it.
 proof fn lemma_attempts_bounded(attempt: u32, max_attempts: u32)
     requires
         attempt < max_attempts,

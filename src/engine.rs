@@ -1,6 +1,7 @@
 //! Request processing: verify, parse, dedup, dispatch, ack.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -13,10 +14,11 @@ use autumn_web::reexports::axum::{
 use autumn_web::time::ClockSource;
 use autumn_web::webhook::WebhookReplayStore;
 use serde_json::{Value, json};
+use tokio::sync::oneshot;
 
 use crate::client::SlackClient;
 use crate::config::SlackConfig;
-use crate::handlers::{Registry, RunOutcome, Runner, SlackContext};
+use crate::handlers::{Handler, Registry, RunOutcome, Runner, SlackContext};
 use crate::metrics::{SlackMetrics, Surface};
 use crate::payload::{CommandResponse, EventCallback, Interaction, Message, SlashCommand};
 use crate::routes::{json as json_reply, status};
@@ -24,6 +26,8 @@ use crate::verify::{SIGNATURE_HEADER, TIMESTAMP_HEADER, Verifier};
 
 /// Header with the retry count of an Events API delivery.
 const RETRY_NUM_HEADER: &str = "x-slack-retry-num";
+/// Header with the retry reason of an Events API delivery.
+const RETRY_REASON_HEADER: &str = "x-slack-retry-reason";
 
 /// The started plugin core. Routes call it.
 pub(crate) struct Engine {
@@ -118,6 +122,7 @@ impl Engine {
                 };
                 ev.retry_num =
                     header(headers, RETRY_NUM_HEADER).and_then(|n| n.trim().parse().ok());
+                ev.retry_reason = header(headers, RETRY_REASON_HEADER).map(str::to_owned);
                 self.event_callback(ev).await
             }
             Some("app_rate_limited") => {
@@ -161,14 +166,15 @@ impl Engine {
     /// Handles `POST {base}/commands`.
     pub(crate) async fn commands(&self, headers: &HeaderMap, body: Bytes) -> Response {
         const S: Surface = Surface::Commands;
+        // Slack can send `ssl_check` with no signature. The reply is a fixed
+        // empty 200 and no handler runs, so it is safe before the check. The
+        // scan keeps no pairs, so an unsigned body costs no extra memory.
+        if url::form_urlencoded::parse(&body).any(|(k, v)| k == "ssl_check" && v == "1") {
+            self.metrics.request(S, "ssl_check");
+            return ok();
+        }
         if let Some(r) = self.check(S, headers, &body) {
             return r;
-        }
-        let form: BTreeMap<String, String> =
-            serde_urlencoded::from_bytes(&body).unwrap_or_default();
-        if form.get("ssl_check").map(String::as_str) == Some("1") {
-            self.metrics.request(S, "ok");
-            return ok();
         }
         let Ok(cmd) = serde_urlencoded::from_bytes::<SlashCommand>(&body) else {
             return self.reject(S);
@@ -180,24 +186,61 @@ impl Engine {
         };
         self.metrics.request(S, "ok");
         let response_url = cmd.response_url.clone();
-        let mut handle = self.runner.spawn(S, Arc::clone(handler), self.ctx(), cmd);
-        if let Ok(done) = tokio::time::timeout(self.ack_timeout(), &mut handle).await {
-            return finished_ok(done).map_or_else(
-                || message_reply(&self.error_message()),
-                |resp| resp.into_message().map_or_else(ok, |m| message_reply(&m)),
-            );
-        }
-        // Too slow: ack now, reply to `response_url` later.
-        self.metrics.handler(S, "late");
         let client = self.client.clone();
         let error = self.error_message();
-        self.runner.spawn_task(async move {
-            let msg = finished_ok(handle.await).map_or(Some(error), CommandResponse::into_message);
+        let rx = self.ack_or_late(S, Arc::clone(handler), cmd, move |res| async move {
+            // Too slow: the ack went out empty. Reply to `response_url`.
+            let msg = res.map_or(Some(error), CommandResponse::into_message);
             if let Some(msg) = msg {
                 late_reply(&client, &response_url, &msg).await;
             }
         });
-        ok()
+        match rx.await {
+            Ok(Some(resp)) => resp.into_message().map_or_else(ok, |m| message_reply(&m)),
+            Ok(None) => message_reply(&self.error_message()),
+            Err(_) => ok(),
+        }
+    }
+
+    /// Runs `handler` with an ack window. One tracked task owns the wait.
+    ///
+    /// The returned receiver gets the result when the handler ends in time
+    /// (`None` for an error or a panic). Otherwise the sender drops, and the
+    /// task calls `late` with the result when the handler ends. It also calls
+    /// `late` when the request is gone before the result.
+    fn ack_or_late<T, R, F, Fut>(
+        &self,
+        surface: Surface,
+        handler: Handler<T, R>,
+        payload: T,
+        late: F,
+    ) -> oneshot::Receiver<Option<R>>
+    where
+        T: Send + 'static,
+        R: Send + 'static,
+        F: FnOnce(Option<R>) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let (tx, rx) = oneshot::channel();
+        let mut handle = self.runner.spawn(surface, handler, self.ctx(), payload);
+        let ack = self.ack_timeout();
+        let metrics = Arc::clone(&self.metrics);
+        self.runner.spawn_task(async move {
+            let res = if let Ok(done) = tokio::time::timeout(ack, &mut handle).await {
+                match tx.send(finished_ok(done)) {
+                    Ok(()) => return,
+                    // The request is gone: the ack is not late. Use the late path.
+                    Err(res) => res,
+                }
+            } else {
+                // Count now: a handler that never ends must still show.
+                metrics.late_ack(surface);
+                drop(tx);
+                finished_ok(handle.await)
+            };
+            late(res).await;
+        });
+        rx
     }
 
     /// Handles `POST {base}/interactions`.
@@ -251,15 +294,13 @@ impl Engine {
                     return self.unhandled(S);
                 };
                 self.metrics.request(S, "ok");
-                let mut handle = self.runner.spawn(S, Arc::clone(handler), self.ctx(), view);
-                let Ok(done) = tokio::time::timeout(self.ack_timeout(), &mut handle).await else {
-                    // The handler runs to its end in the tracker. Its reply is lost.
-                    self.metrics.handler(S, "late");
-                    tracing::warn!("slack view_submission handler missed the ack; the view closes");
-                    return ok();
-                };
-                // An empty 200 closes the modal. No error detail goes to Slack.
-                finished_ok(done)
+                let rx = self.ack_or_late(S, Arc::clone(handler), view, |_| async {
+                    tracing::warn!("slack view_submission reply lost: the ack went out first");
+                });
+                // An empty 200 closes the view. No error detail goes to Slack.
+                rx.await
+                    .ok()
+                    .flatten()
                     .and_then(|r| r.to_body())
                     .map_or_else(ok, |b| json_reply(&b))
             }
@@ -278,6 +319,11 @@ impl Engine {
                 self.metrics.request(S, "ok");
                 drop(self.runner.spawn(S, Arc::clone(handler), self.ctx(), sc));
                 ok()
+            }
+            Interaction::BlockSuggestion => {
+                // Options load is not in scope. No options shows no error in Slack.
+                self.metrics.request(S, "unhandled");
+                json_reply(&json!({ "options": [] }))
             }
             Interaction::Other => self.unhandled(S),
         }

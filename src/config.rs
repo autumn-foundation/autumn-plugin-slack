@@ -2,11 +2,13 @@
 //!
 //! Sources, in order (later wins):
 //! 1. `[slack]` in `autumn.toml`.
-//! 2. `[profile.<name>.slack]` in `autumn.toml`.
-//! 3. `[slack]` in the profile file, for example `autumn-prod.toml`.
-//! 4. `.env` values, then the process environment: `AUTUMN_SLACK__<PATH>`,
-//!    for example `AUTUMN_SLACK__API__MAX_ATTEMPTS=5`. A list value is a
-//!    comma-separated string.
+//! 2. `[slack]` in the profile file, for example `autumn-prod.toml`.
+//! 3. `.env` values, then the process environment: `AUTUMN_SLACK__<PATH>`,
+//!    for example `AUTUMN_SLACK__API__MAX_ATTEMPTS=5`. In an env var, put a
+//!    comma between list items.
+//!
+//! The plugin does not read `[profile.<name>.slack]` in `autumn.toml`. With
+//! `[server] strict_config = true`, autumn stops at boot on that section.
 //!
 //! Secrets are not in the config. The config holds the names of the env vars
 //! that hold them.
@@ -22,8 +24,9 @@ use crate::policy::{DEFAULT_TOLERANCE_SECS, MAX_ATTEMPTS, RetryRule};
 pub const SECTION: &str = "slack";
 /// Prefix for environment overrides.
 pub const ENV_PREFIX: &str = "AUTUMN_SLACK__";
-/// Slack wants an ack in 3 s. The ack timeout must be less.
-pub const MAX_ACK_TIMEOUT_MS: u64 = 2_900;
+/// Slack must get an ack in 3 s, network time included. The ack timeout
+/// keeps 300 ms or more for the network.
+pub const MAX_ACK_TIMEOUT_MS: u64 = 2_700;
 
 /// Plugin configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,18 +39,19 @@ pub struct SlackConfig {
     pub previous_signing_secret_envs: Vec<String>,
     /// Env var with the bot token (`xoxb-...`).
     pub bot_token_env: String,
-    /// Web API base URL. It ends with `/`.
+    /// Web API base URL. It ends with `/`. Plain `http` only on a loopback
+    /// host (for local tests).
     pub api_base_url: String,
     /// Largest distance between the request timestamp and now, 1 to 3600 s.
     pub timestamp_tolerance_secs: u64,
     /// Time to wait for a command or view handler before an empty ack,
-    /// 1 to 2900 ms.
+    /// 1 to 2700 ms.
     pub ack_timeout_ms: u64,
     /// Largest request body.
     pub max_body_bytes: usize,
     /// Time to remember an event ID, to drop Slack retries.
     pub dedup_window_secs: u64,
-    /// Time to wait for in-flight handlers at shutdown.
+    /// Time to wait for running handlers at shutdown.
     pub drain_timeout_secs: u64,
     /// Reply text when a command handler fails. No error detail goes to Slack.
     pub error_text: String,
@@ -125,7 +129,7 @@ impl ApiConfig {
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct HealthConfig {
-    /// Time to keep an `auth.test` result.
+    /// Time to keep an `Up` result. A `Down` result stays 5 s or less.
     pub cache_secs: u64,
 }
 
@@ -142,15 +146,13 @@ impl SlackConfig {
     /// Returns [`SlackError::Config`] for bad TOML, unknown keys, or failed
     /// validation.
     pub fn from_toml_str(autumn_toml: &str) -> Result<Self, SlackError> {
-        Self::from_layers(Some(autumn_toml), &[], None, std::iter::empty())
+        Self::from_layers(Some(autumn_toml), None, std::iter::empty())
     }
 
-    /// Merges, in order: `[slack]` in `base`, `[profile.<name>.slack]` in
-    /// `base` for each of `profile_names`, `[slack]` in `profile_file`, and
-    /// env vars. Then validates.
+    /// Merges, in order: `[slack]` in `base`, `[slack]` in `profile_file`,
+    /// and env vars. Then validates.
     fn from_layers(
         base: Option<&str>,
-        profile_names: &[String],
         profile_file: Option<&str>,
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Self, SlackError> {
@@ -158,20 +160,10 @@ impl SlackConfig {
             toml::from_str(text).map_err(|e| SlackError::Config(format!("toml: {e}")))
         };
         let mut table = toml::Table::new();
-        if let Some(text) = base {
-            let file = parse(text)?;
-            if let Some(toml::Value::Table(section)) = file.get(SECTION) {
-                merge(&mut table, section.clone());
-            }
-            for name in inline_profile_order(profile_names) {
-                if let Some(toml::Value::Table(section)) = file
-                    .get("profile")
-                    .and_then(|p| p.get(&name))
-                    .and_then(|p| p.get(SECTION))
-                {
-                    merge(&mut table, section.clone());
-                }
-            }
+        if let Some(text) = base
+            && let Some(toml::Value::Table(section)) = parse(text)?.get(SECTION)
+        {
+            merge(&mut table, section.clone());
         }
         if let Some(text) = profile_file
             && let Some(toml::Value::Table(section)) = parse(text)?.get(SECTION)
@@ -224,7 +216,7 @@ impl SlackConfig {
                 break;
             }
         }
-        Self::from_layers(base.as_deref(), profile_names, profile.as_deref(), env)
+        Self::from_layers(base.as_deref(), profile.as_deref(), env)
     }
 
     /// Loads config like autumn-web does: `$AUTUMN_MANIFEST_DIR` (else `.`),
@@ -275,10 +267,10 @@ impl SlackConfig {
         {
             return bad("previous_signing_secret_envs must not hold an empty name".to_owned());
         }
-        let base = &self.api_base_url;
-        if !(base.starts_with("https://") || base.starts_with("http://")) || !base.ends_with('/') {
+        if !valid_base_url(&self.api_base_url) {
             return bad(format!(
-                "api_base_url must be an http(s) URL that ends with /: {base}"
+                "api_base_url must be an https URL that ends with / (http only on loopback): {}",
+                self.api_base_url
             ));
         }
         if !(1..=3_600).contains(&self.timestamp_tolerance_secs) {
@@ -358,15 +350,18 @@ fn profile_flag() -> Option<String> {
         .filter(|p| !p.trim().is_empty())
 }
 
-/// Inline `[profile.<name>]` merge order of autumn-web: the long alias first,
-/// so the short name wins.
-fn inline_profile_order(profile_names: &[String]) -> Vec<String> {
-    let mut names = profile_names.to_vec();
-    names.sort_by_key(|n| match n.as_str() {
-        "production" | "development" => 0,
-        _ => 1,
-    });
-    names
+/// An `https` URL that ends with `/`, or `http` on a loopback host.
+fn valid_base_url(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let loopback = match u.host() {
+        Some(url::Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    url.ends_with('/') && (u.scheme() == "https" || (u.scheme() == "http" && loopback))
 }
 
 fn read_optional(path: &Path) -> Result<Option<String>, SlackError> {
@@ -409,7 +404,7 @@ fn insert_path(table: &mut toml::Table, path: &[String], value: toml::Value) {
     cur.insert(last.clone(), value);
 }
 
-/// Types an env value like the default value at the same path. A list is a
+/// Converts an env value to the type of the default at the same path. A list is a
 /// comma-separated string.
 fn typed_env_value(schema: &toml::Table, path: &[String], raw: &str) -> Option<toml::Value> {
     let mut node: Option<&toml::Value> = None;
@@ -470,7 +465,6 @@ mod tests {
     fn env_overlay_types_values() {
         let c = SlackConfig::from_layers(
             None,
-            &[],
             None,
             env(&[
                 ("AUTUMN_SLACK__ACK_TIMEOUT_MS", "100"),
@@ -515,15 +509,31 @@ mod tests {
     }
 
     #[test]
-    fn inline_profile_long_alias_first() {
-        let base = "[slack]\nack_timeout_ms = 1\n[profile.production.slack]\nack_timeout_ms = 2\n[profile.prod.slack]\nack_timeout_ms = 3\n";
-        let c = SlackConfig::from_layers(
-            Some(base),
-            &["prod".to_owned(), "production".to_owned()],
-            None,
-            std::iter::empty(),
-        )
-        .unwrap();
-        assert_eq!(c.ack_timeout_ms, 3);
+    fn inline_profile_section_is_not_read() {
+        // autumn strict config rejects `[profile.x.slack]`, so the plugin ignores it.
+        let base = "[slack]\nack_timeout_ms = 1\n[profile.prod.slack]\nack_timeout_ms = 3\n";
+        let c = SlackConfig::from_toml_str(base).unwrap();
+        assert_eq!(c.ack_timeout_ms, 1);
+    }
+
+    #[test]
+    fn base_url_rules() {
+        for ok in [
+            "https://slack.com/api/",
+            "http://127.0.0.1:9/api/",
+            "http://localhost/api/",
+            "http://[::1]:8/x/",
+        ] {
+            assert!(valid_base_url(ok), "{ok}");
+        }
+        for bad in [
+            "http://slack.com/api/",
+            "http://10.0.0.1/api/",
+            "https://slack.com/api",
+            "ftp://x/",
+            "nope",
+        ] {
+            assert!(!valid_base_url(bad), "{bad}");
+        }
     }
 }

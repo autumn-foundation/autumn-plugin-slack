@@ -204,7 +204,7 @@ async fn captcha_without_exemption_fails_start() {
 #[tokio::test]
 async fn health_unknown_before_start_and_without_token() {
     let t = MemoryTransport::new();
-    let rt = SlackPlugin::with_config(config())
+    let rt = SlackPlugin::with_config(no_token_config())
         .with_signing_secret(SECRET)
         .with_transport(t)
         .start(&AppState::for_test())

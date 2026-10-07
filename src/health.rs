@@ -12,19 +12,36 @@ use tokio::time::Instant;
 use crate::client::SlackClient;
 use crate::error::SlackError;
 
+/// Time limit for one check. 1.5 s is less than the 2 s autumn indicator
+/// timeout.
+const CHECK_TIMEOUT: Duration = Duration::from_millis(1_500);
+/// Largest time to keep a `Down` result. A short outage clears fast.
+pub const DOWN_TTL: Duration = Duration::from_secs(5);
+
+/// A stored result and its expiry.
+#[derive(Clone)]
+struct Entry {
+    stored: Instant,
+    until: Instant,
+    out: HealthCheckOutput,
+}
+
 /// Checks the bot token with `auth.test`.
 ///
 /// - `Up`: Slack accepts the token.
 /// - `Down`: Slack rejects it, or the call fails.
 /// - `Unknown`: before start, or with no bot token.
 ///
-/// It keeps a result for `[slack.health] cache_secs`. Details give a short
-/// error code only.
+/// It keeps `Up` for `[slack.health] cache_secs` and `Down` for 5 s or less.
+/// One check runs at a time. Other probes get the result of that check. Details give a
+/// short error code only.
 pub struct SlackHealth {
     client: OnceLock<SlackClient>,
     readiness: bool,
-    cache: Mutex<Option<(Instant, HealthCheckOutput)>>,
+    cache: Mutex<Option<Entry>>,
     cache_for: OnceLock<Duration>,
+    /// Lets one check run at a time.
+    refresh: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for SlackHealth {
@@ -43,6 +60,7 @@ impl SlackHealth {
             readiness,
             cache: Mutex::new(None),
             cache_for: OnceLock::new(),
+            refresh: tokio::sync::Mutex::const_new(()),
         }
     }
 
@@ -52,27 +70,57 @@ impl SlackHealth {
         let _ = self.client.set(client);
     }
 
-    fn cached(&self) -> Option<HealthCheckOutput> {
-        let ttl = *self.cache_for.get()?;
-        let (at, out) = self
-            .cache
+    fn entry(&self) -> Option<Entry> {
+        self.cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()?;
-        (at.elapsed() < ttl).then_some(out)
+            .clone()
+    }
+
+    fn cached(&self) -> Option<HealthCheckOutput> {
+        let entry = self.entry()?;
+        (Instant::now() < entry.until).then_some(entry.out)
+    }
+
+    /// A result stored at or after `since`, whatever its TTL. A probe that
+    /// waited for another check uses that check's result.
+    fn stored_since(&self, since: Instant) -> Option<HealthCheckOutput> {
+        let entry = self.entry()?;
+        (entry.stored >= since).then_some(entry.out)
     }
 
     fn store(&self, out: &HealthCheckOutput) {
+        let up_ttl = self.cache_for.get().copied().unwrap_or_default();
+        let ttl = if out.status == HealthStatus::Up {
+            up_ttl
+        } else {
+            up_ttl.min(DOWN_TTL)
+        };
         *self
             .cache
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-            Some((Instant::now(), out.clone()));
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Entry {
+            stored: Instant::now(),
+            until: Instant::now() + ttl,
+            out: out.clone(),
+        });
+    }
+
+    async fn run_check(client: &SlackClient) -> HealthCheckOutput {
+        let down = |code: String| {
+            HealthCheckOutput::down()
+                .with_details(HashMap::from([("error".to_owned(), json!(code))]))
+        };
+        match tokio::time::timeout(CHECK_TIMEOUT, client.auth_test_once()).await {
+            Ok(Ok(())) => HealthCheckOutput::up(),
+            Ok(Err(e)) => {
+                tracing::warn!(error = %e, "slack health check failed");
+                down(error_code(&e))
+            }
+            Err(_) => down("timeout".to_owned()),
+        }
     }
 }
-
-/// Time limit for one check.
-const CHECK_TIMEOUT: Duration = Duration::from_millis(1_500);
 
 /// A short error code for public health output.
 fn error_code(err: &SlackError) -> String {
@@ -109,18 +157,14 @@ impl HealthIndicator for SlackHealth {
             if let Some(out) = self.cached() {
                 return out;
             }
-            // Under the 2 s indicator timeout.
-            let result = tokio::time::timeout(CHECK_TIMEOUT, client.auth_test()).await;
-            let out = match result {
-                Ok(Ok(_)) => HealthCheckOutput::up(),
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "slack health check failed");
-                    HealthCheckOutput::down()
-                        .with_details(HashMap::from([("error".to_owned(), json!(error_code(&e)))]))
-                }
-                Err(_) => HealthCheckOutput::down()
-                    .with_details(HashMap::from([("error".to_owned(), json!("timeout"))])),
-            };
+            // Single flight: a probe that waits here gets the new result,
+            // also with `cache_secs = 0`.
+            let since = Instant::now();
+            let _turn = self.refresh.lock().await;
+            if let Some(out) = self.cached().or_else(|| self.stored_since(since)) {
+                return out;
+            }
+            let out = Self::run_check(client).await;
             self.store(&out);
             out
         })

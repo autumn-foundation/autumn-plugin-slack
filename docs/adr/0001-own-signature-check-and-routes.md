@@ -39,7 +39,7 @@ Option 2.
 
 ## Results
 
-- Good: all three routes are verified the same way, before any parse.
+- Good: the plugin checks all three routes the same way, before it parses the body.
 - Good: secret rotation works on all routes.
 - Bad: two signature checks exist in an app that also uses `SignedWebhook`.
 
@@ -52,7 +52,13 @@ Option 2.
 - **The base path is a builder setting.** autumn mounts routes before it
   loads config.
 - **CSRF and CAPTCHA:** a plugin cannot add an exemption. The plugin checks
-  at startup and fails with the config fix.
+  at startup and fails with the config fix. The check uses autumn's rules:
+  CAPTCHA only on form routes, and not with `dev_bypass`.
+- **Start in a state initializer.** autumn starts job workers before startup
+  hooks. The plugin starts first, so a `#[job]` gets the client. A startup
+  hook then reports a start error, because an initializer cannot fail.
+- **Process roles:** a `worker` serves no routes. It needs no signing secret
+  and no exemption.
 
 ## Upstream seams (proposed)
 

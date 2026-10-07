@@ -22,6 +22,7 @@ ack_timeout_ms = 1000
 [slack.api]
 max_attempts = 4
 
+# Ignored: autumn strict config rejects this section.
 [profile.prod.slack]
 ack_timeout_ms = 1500
 "#,
@@ -29,7 +30,7 @@ ack_timeout_ms = 1500
     .unwrap();
     std::fs::write(
         dir.join("autumn-prod.toml"),
-        "[slack]\nsigning_secret_env = \"PROD_SECRET\"\n",
+        "[slack]\nsigning_secret_env = \"PROD_SECRET\"\nack_timeout_ms = 1200\n",
     )
     .unwrap();
     let env = vec![
@@ -42,7 +43,7 @@ ack_timeout_ms = 1500
     ];
     let c = SlackConfig::load_from_dir(&dir, &["prod".to_owned()], env).unwrap();
     assert_eq!(c.bot_token_env, "BASE_TOKEN");
-    assert_eq!(c.ack_timeout_ms, 1500);
+    assert_eq!(c.ack_timeout_ms, 1200);
     assert_eq!(c.signing_secret_env, "PROD_SECRET");
     assert_eq!(c.api.max_attempts, 5);
     assert_eq!(c.response_url_hosts, ["hooks.slack.com", "hooks.example"]);

@@ -103,7 +103,13 @@ async fn dispatch(
         COMMANDS => Surface::Commands,
         _ => Surface::Interactions,
     };
-    // Read at most `max_body_bytes`. Verify needs the exact bytes.
+    // Shutdown started: run no new handler. A 503 lets Slack retry events.
+    // This check comes before the dedup, so a retry is not dropped.
+    if engine.runner.tracker.is_closed() {
+        engine.metrics.request(surface, "shutting_down");
+        return status(StatusCode::SERVICE_UNAVAILABLE);
+    }
+    // Read at most `max_body_bytes`. The signature check needs the exact bytes.
     let Ok(bytes) = to_bytes(body, engine.config.max_body_bytes).await else {
         engine.metrics.request(surface, "too_large");
         return status(StatusCode::PAYLOAD_TOO_LARGE);

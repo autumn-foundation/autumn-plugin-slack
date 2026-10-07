@@ -1,7 +1,8 @@
 //! Boots a real app (not `TestApp`) with only the Slack plugin.
 //!
-//! Regression: autumn refuses to start with no `Route`. The plugin must give
-//! real routes, not only a nested router.
+//! Regressions: autumn refuses to start with no `Route`, so the plugin must
+//! give real routes. A `#[job]` must get the client, so the plugin must start
+//! before job workers.
 //!
 //! The test runs this test binary again as a child process, with the env
 //! vars set. So it changes no env in this process.
@@ -10,9 +11,10 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use autumn_plugin_slack::{SlackPlugin, testing};
+use autumn_plugin_slack::{SlackClient, SlackPlugin, testing};
 
 const SECRET: &str = "boot-test-secret";
+const OLD_SECRET: &str = "boot-test-old-secret";
 const CHILD_MARK: &str = "SLACK_BOOT_TEST_CHILD";
 
 /// The server. It runs only in the child process.
@@ -22,7 +24,18 @@ async fn boot_child_server() {
     if std::env::var(CHILD_MARK).is_err() {
         return;
     }
-    autumn_web::app().plugin(SlackPlugin::new()).run().await;
+    autumn_web::app()
+        .plugin(SlackPlugin::new())
+        // autumn runs state initializers before job workers and startup
+        // hooks. The client must be ready here, so a `#[job]` can use it.
+        .state_initializer(|state| {
+            if SlackClient::from_state(state).is_none() {
+                eprintln!("no SlackClient before job workers start");
+                std::process::exit(3);
+            }
+        })
+        .run()
+        .await;
 }
 
 struct KillOnDrop(Child);
@@ -40,6 +53,8 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
+    let dir = std::env::temp_dir().join(format!("slack-boot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
     let mut child = KillOnDrop(
         Command::new(std::env::current_exe().unwrap())
             .args([
@@ -48,10 +63,22 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
                 "--include-ignored",
                 "--nocapture",
             ])
+            // A clean env and an empty dir: a developer's AUTUMN_* vars,
+            // `.env`, or `autumn.toml` cannot change the result.
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("AUTUMN_MANIFEST_DIR", &dir)
+            .current_dir(&dir)
             .env(CHILD_MARK, "1")
             .env("AUTUMN_SERVER__PORT", port.to_string())
             .env("AUTUMN_SERVER__HOST", "127.0.0.1")
             .env("SLACK_SIGNING_SECRET", SECRET)
+            // Rotation: the old secret comes from a named env var.
+            .env(
+                "AUTUMN_SLACK__PREVIOUS_SIGNING_SECRET_ENVS",
+                "SLACK_BOOT_OLD_SECRET",
+            )
+            .env("SLACK_BOOT_OLD_SECRET", OLD_SECRET)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -60,8 +87,20 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
     let body = r#"{"type":"url_verification","challenge":"boot"}"#;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://127.0.0.1:{port}/slack/events");
+    let signed_post = |secret: &'static str| {
+        let ts = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
+        let [(h1, v1), (h2, v2)] = testing::signed_headers(secret, ts, body.as_bytes());
+        client
+            .post(&url)
+            .header(h1, v1)
+            .header(h2, v2)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+    };
+    // Wait for the app to boot.
     let start = Instant::now();
-    loop {
+    let first = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             let mut err = String::new();
             if let Some(mut e) = child.0.stderr.take() {
@@ -73,21 +112,20 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
             start.elapsed() < Duration::from_secs(60),
             "the app did not answer"
         );
-        let ts = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
-        let [(h1, v1), (h2, v2)] = testing::signed_headers(SECRET, ts, body.as_bytes());
-        if let Ok(res) = client
-            .post(&url)
-            .header(h1, v1)
-            .header(h2, v2)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-        {
-            assert_eq!(res.status().as_u16(), 200);
-            assert!(res.text().await.unwrap().contains("boot"));
-            break;
+        if let Ok(res) = signed_post(SECRET).await {
+            break res;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
+    assert_eq!(first.status().as_u16(), 200);
+    assert!(first.text().await.unwrap().contains("boot"));
+    // Rotation: the old secret from the named env var also verifies.
+    assert_eq!(
+        signed_post(OLD_SECRET).await.unwrap().status().as_u16(),
+        200
+    );
+    assert_eq!(
+        signed_post("not-a-secret").await.unwrap().status().as_u16(),
+        401
+    );
 }

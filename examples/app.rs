@@ -20,7 +20,8 @@ use serde_json::json;
 /// Replies in the thread of a mention.
 async fn on_mention(ctx: SlackContext, ev: EventCallback) -> HandlerResult<()> {
     let msg: MessageEvent = ev.parse()?;
-    let (Some(channel), Some(ts)) = (msg.channel, msg.ts) else {
+    // A reply in a thread uses the parent `ts`.
+    let (Some(channel), Some(ts)) = (msg.channel, msg.thread_ts.or(msg.ts)) else {
         return Ok(());
     };
     ctx.client()

@@ -4,7 +4,7 @@ Style: ASD-STE100. Short sentences. Active voice.
 
 ## 1. Problem
 
-Teams build Slack apps next to their web apps.
+Teams build Slack apps together with their web apps.
 A Slack app gets signed HTTP requests from Slack and calls the Slack Web API.
 autumn-web 0.8 can verify Slack Events API requests (`SignedWebhook`).
 It cannot verify slash commands or interactions. They have no delivery ID.
@@ -51,12 +51,12 @@ Selected scope: items 1 to 7.
 | Run a handler twice on a Slack retry. | Drop a repeat `event_id` with the replay store. Reply 200, so Slack stops. |
 | Miss the 3 s ack. Slack shows an error and retries. | Events and actions: ack at once, run in the background. Commands and views: wait up to `ack_timeout_ms`, then ack and finish later. |
 | Lose a slow command reply. | Post the late reply to `response_url`. |
-| SSRF through a forged `response_url`. | Allow only `https://hooks.slack.com/`. |
+| SSRF through a forged `response_url`. | Allow only HTTPS hosts in `response_url_hosts` (default `hooks.slack.com`). No user info, no port. |
 | Retry `chat.postMessage` after a 5xx. Post twice. | Retry 5xx and network errors only for read methods. Retry 429 for all. |
 | Wait forever on a large `Retry-After`. | Cap the wait. Give up with `RateLimited` above the cap. Proven in the spec. |
-| A handler panic kills the request or the process. | Catch the panic. Reply with the error text. Count it. |
+| A handler panic stops the request or the process. | Catch the panic. Reply with the error text. Count it. |
 | CSRF blocks every Slack request in production. | Check at startup. Fail with the exact config fix. |
-| Huge body uses memory. | Read at most `max_body_bytes`. Reply 413. |
+| A large body uses too much memory. | Read at most `max_body_bytes`. Reply 413. |
 | Leak the token or secret. | Read them from named env vars. Never log them. Never put them in errors. |
 | Unbounded metric labels from Slack data. | Labels come from fixed sets and method names in code. Never event types or IDs. |
 | Shutdown drops in-flight handlers. | Track tasks. Wait up to `drain_timeout_secs`. |
@@ -66,11 +66,11 @@ Selected scope: items 1 to 7.
 ## 5. Six thinking hats
 
 - **White (facts):** Slack signs with `v0:{ts}:{body}`. Header `X-Slack-Signature: v0=<hex>`. Slack wants a reply in 3 s. Slack retries events up to 3 times with `X-Slack-Retry-Num`. Commands and interactions are form posts. Interactions put JSON in the `payload` field. `response_url` is valid for 30 min and 5 uses. Web API errors come as HTTP 200 with `ok: false`. Rate limits come as HTTP 429 with `Retry-After`.
-- **Red (feelings):** Users want `.command("/deploy", handler)` and nothing more. A 403 from CSRF with no hint feels bad.
+- **Red (feelings):** Users want `.command("/deploy", handler)` and nothing more. A 403 from CSRF with no help text confuses the user.
 - **Black (risks):** autumn applies CSRF and CAPTCHA to plugin routes. A plugin cannot add an exemption. We fail at startup with a clear message. The route path must be a builder setting: autumn mounts routes before it loads config. Background handlers are not durable. A crash loses them. We document: use `#[job]` for durable work.
 - **Yellow (benefits):** One install gives verified, routed, typed Slack handlers and a client. No Bolt app server to run.
 - **Green (ideas):** Upstream seam: let a plugin add CSRF exemptions in `build()`. Upstream seam: let `SignedWebhook` accept a request with no replay ID. A typed Block Kit crate later.
-- **Blue (process):** Spec the pure policy (Verus). Write failing tests. Implement. Refactor. Review with agents from several angles. Check each AC.
+- **Blue (process):** Write the Verus spec for the policy. Write failing tests. Implement. Refactor. Review with agents from several angles. Check each AC.
 
 ## 6. Design
 
@@ -82,8 +82,8 @@ flowchart LR
   V -->|ok| P[parse]
   P -->|event retry seen| D[200, skip]
   P --> H[handler registry]
-  H -->|events, actions, shortcuts| BG[background task] --> A1[200 at once]
-  H -->|commands, views| T{done in ack_timeout?}
+  H -->|events, actions, view_closed, shortcuts| BG[background task] --> A1[200 immediately]
+  H -->|commands, view_submission| T{done in ack_timeout?}
   T -->|yes| RESP[200 with reply]
   T -->|no| A2[200 empty] --> LATE[late reply to response_url]
   BG --> C[SlackClient]
@@ -117,20 +117,26 @@ Modules:
 
 - **AC1** `SlackPlugin` implements `autumn_web::plugin::Plugin`. One call installs it. It declares a contract for autumn-web 0.8 and the `[slack]` config section.
 - **AC2** The plugin verifies each request: `v0` HMAC-SHA256 on the raw body, constant-time compare, timestamp tolerance (default 300 s), and previous secrets for rotation. Missing or bad headers give 400. A stale timestamp or a bad signature gives 401. No handler runs before the check.
-- **AC3** Events API: the plugin answers `url_verification`. It sends `event_callback` to a handler by event type. It acks with 200 before the handler runs. It drops a repeat `event_id` (replay store, memory default). It ignores unknown events with 200.
+- **AC3** Events API: the plugin answers `url_verification`. It sends `event_callback` to a handler by event type. The 200 ack does not wait for the handler. It drops a repeat `event_id` (replay store, memory default). It ignores unknown events with 200.
 - **AC4** Slash commands: a typed `SlashCommand` goes to a handler by command name. The reply is ephemeral, in-channel, or an empty ack. A handler slower than `ack_timeout_ms` gets an empty ack. Its reply goes to `response_url` later. An unknown command gets an ephemeral reply.
 - **AC5** Interactivity: `block_actions` by `action_id`, `view_submission` and `view_closed` by `callback_id`, `shortcut` and `message_action` by `callback_id`. A view submission can reply `clear`, `update`, `push`, or `errors`. An action handler can reply to `response_url`.
 - **AC6** `SlackClient` calls any Web API method and has typed calls: `chat.postMessage`, `chat.update`, `chat.delete`, `chat.postEphemeral`, `reactions.add`, `views.open`, `views.update`, `views.push`, `views.publish`, `users.info`, `auth.test`. `ok: false` gives a typed error with the Slack code. It paginates with `next_cursor`.
 - **AC7** Retry: 429 waits `Retry-After` (capped) and retries. 5xx and network errors retry with backoff only for read methods. Attempts are bounded.
 - **AC8** `response_url` posts go only to an allowed host (default `hooks.slack.com`) over HTTPS.
 - **AC9** Handler errors and panics do not crash the app. They give the error text (commands) or a log and a counter. Shutdown waits for in-flight handlers up to `drain_timeout_secs`.
-- **AC10** A health indicator (`auth.test`, cached, opt-in readiness). A metrics source with request, handler, and API counters. Labels have a fixed set of values.
+- **AC10** A health indicator (`auth.test`, cached, opt-in readiness). A metrics source with request, handler, and API counters. A label value is a fixed word or a method name from code.
 - **AC11** Serde config with validation, layered TOML, `AUTUMN_SLACK__*` env vars, and secrets from named env vars. Startup fails when a secret is missing, or when CSRF or CAPTCHA would block the Slack routes.
 - **AC12** `testing::sign` and `MemoryTransport` are public for app tests.
 - **AC13** `cargo fmt`, clippy pedantic and nursery are clean. No `unwrap` in production code. Unit, property, and integration tests pass. Coverage is 85% or more. CI runs these.
 - **AC14** Verus specs state the policy invariants. Proofs pass.
 - **AC15** README, CLAUDE.md, ADRs, and a Mermaid diagram. All docs use ASD-STE100.
 
-## 9. Out of scope
+## 9. Review
 
-OAuth v2 install flow and a per-workspace token store. Socket Mode. File uploads. Typed Block Kit builders. Options load. Workflow steps. A Web API alert channel (autumn `[alerts]` has Slack).
+Six agents reviewed the code: security, Slack protocol, autumn integration,
+concurrency, tests and spec, and docs. `docs/ac-evidence.md` lists the
+findings and the fixes.
+
+## 10. Out of scope
+
+OAuth v2 install flow and a per-workspace token store. Socket Mode. File uploads. Typed Block Kit builders. Options load. Workflow steps. A limit on concurrent handlers. A Web API alert channel (autumn `[alerts]` has Slack).

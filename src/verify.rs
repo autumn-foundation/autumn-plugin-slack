@@ -76,10 +76,16 @@ impl std::fmt::Debug for Verifier {
 
 impl Verifier {
     /// Makes a verifier. `previous` holds old secrets during rotation.
+    ///
+    /// It ignores an empty or blank secret. HMAC accepts an empty key, so an
+    /// empty secret would let anyone sign. With no secret left, all checks fail.
     #[must_use]
     pub fn new(secret: &str, previous: &[String], tolerance_secs: u64) -> Self {
-        let mut secrets = vec![secret.as_bytes().to_vec()];
-        secrets.extend(previous.iter().map(|s| s.as_bytes().to_vec()));
+        let secrets = std::iter::once(secret)
+            .chain(previous.iter().map(String::as_str))
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
         Self {
             secrets,
             tolerance_secs,
@@ -241,6 +247,24 @@ mod tests {
             v.verify(Some(DOC_TS), Some(DOC_SIG), DOC_BODY.as_bytes(), now()),
             Err(VerifyError::Mismatch)
         );
+    }
+
+    #[test]
+    fn empty_secrets_never_verify() {
+        // Regression: an empty previous secret let anyone sign with an empty key.
+        let body = b"command=%2Fx";
+        let forged = signature(b"", DOC_TS, body);
+        let v = Verifier::new(DOC_SECRET, &[String::new(), "  ".to_owned()], 300);
+        assert_eq!(
+            v.verify(Some(DOC_TS), Some(&forged), body, now()),
+            Err(VerifyError::Mismatch)
+        );
+        let v = Verifier::new("", &[], 300);
+        assert_eq!(
+            v.verify(Some(DOC_TS), Some(&forged), body, now()),
+            Err(VerifyError::Mismatch)
+        );
+        assert!(format!("{v:?}").contains("secrets: 0"));
     }
 
     #[test]

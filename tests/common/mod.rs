@@ -36,6 +36,13 @@ pub fn config() -> SlackConfig {
     c
 }
 
+/// Config whose bot token env var is never set, so no token is found.
+pub fn no_token_config() -> SlackConfig {
+    let mut c = config();
+    "AUTUMN_SLACK_TEST_NO_SUCH_TOKEN".clone_into(&mut c.bot_token_env);
+    c
+}
+
 /// Config with a short ack window, for slow-path tests.
 pub fn slow_config() -> SlackConfig {
     let mut c = config();
