@@ -18,7 +18,7 @@ No GitHub issue exists for this work. Section 8 gives the acceptance criteria.
 | Autumn feature | Doc or source | Plugin use |
 |---|---|---|
 | `Plugin` trait, `PluginContract` | `extensibility`, `plugin.rs` | `SlackPlugin` is a one-line install for autumn-web 0.8. |
-| `AppBuilder::nest`, `declare_plugin_routes` | `app.rs` | Mount the three Slack routes. Show them in `autumn routes`. |
+| `Route`, `AppBuilder::routes` | `route.rs`, `app.rs` | Mount the three Slack routes. They show in `autumn routes`. |
 | `config_section` | `app.rs` | Accept `[slack]` in strict config. |
 | `on_startup`, `on_shutdown` | `app.rs` | Load config at startup. Drain handlers at shutdown. |
 | `HealthIndicator`, `MetricsSource` | `health-indicators`, `metrics-sources` | Health from `auth.test`. Counters on `/actuator/prometheus`. |
@@ -100,8 +100,9 @@ Modules:
 - `transport` — `HttpTransport` trait, `ReqwestTransport`, `MemoryTransport`.
 - `client` — `SlackClient`. Web API calls and `response_url` posts.
 - `payload` — typed Slack payloads and replies.
-- `handlers` — handler registry and dispatch.
-- `routes` — axum routes for the three surfaces.
+- `handlers` — handler types, registry, and task runner.
+- `engine` — request processing: verify, parse, dedup, dispatch, ack.
+- `routes` — autumn `Route` values for the three surfaces. autumn needs one or more `Route` to boot.
 - `health`, `metrics` — health indicator and metrics source.
 - `plugin` — `SlackPlugin`, `SlackRuntime`.
 - `testing` — request signing for app tests.

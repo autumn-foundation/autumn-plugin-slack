@@ -22,6 +22,10 @@ pub const fn backoff_ms(initial: u64, attempt: u32, cap: u64) -> u64 {
     let mut b = if initial <= cap { initial } else { cap };
     let mut i = 1;
     while i < attempt {
+        // At the cap or at zero: stop early. A large `attempt` costs no time.
+        if b == cap || b == 0 {
+            return b;
+        }
         // Compare without overflow: `cap - b <= b` is `2b >= cap`.
         b = if cap - b <= b { cap } else { b * 2 };
         i += 1;
@@ -159,6 +163,9 @@ mod tests {
         assert_eq!(backoff_ms(100, 5, 1_000), 1_000);
         assert_eq!(backoff_ms(5_000, 1, 1_000), 1_000);
         assert_eq!(backoff_ms(u64::MAX, 60, u64::MAX), u64::MAX);
+        // Early stop at the cap: this returns at once.
+        assert_eq!(backoff_ms(1, u32::MAX, 8), 8);
+        assert_eq!(backoff_ms(0, u32::MAX, 8), 0);
     }
 
     #[test]

@@ -27,11 +27,42 @@ pub fn now_secs() -> u64 {
     u64::try_from(now().timestamp()).unwrap()
 }
 
+/// Test config. The ack window is wide, so in-time tests do not depend on
+/// CPU load. Slow-path tests use [`slow_config`] and a [`Gate`].
 pub fn config() -> SlackConfig {
     let mut c = SlackConfig::default();
-    c.ack_timeout_ms = 200;
+    c.ack_timeout_ms = 2_000;
     c.api.initial_backoff_ms = 1;
     c
+}
+
+/// Config with a short ack window, for slow-path tests.
+pub fn slow_config() -> SlackConfig {
+    let mut c = config();
+    c.ack_timeout_ms = 50;
+    c
+}
+
+/// A closed gate. A handler waits on it; the test opens it. No timing.
+#[derive(Clone, Default)]
+pub struct Gate(Arc<tokio::sync::Notify>);
+
+impl Gate {
+    pub async fn wait(&self) {
+        self.0.notified().await;
+    }
+
+    /// Opens the gate. A later `wait` also passes.
+    pub fn open(&self) {
+        self.0.notify_one();
+    }
+}
+
+/// Fails if `fut` does not end in 10 s. Use it where a hang is the bug.
+pub async fn within<F: std::future::Future>(fut: F) -> F::Output {
+    tokio::time::timeout(Duration::from_secs(10), fut)
+        .await
+        .expect("did not end in 10 s")
 }
 
 /// A plugin with test secrets, a fixed clock, and this fake transport.

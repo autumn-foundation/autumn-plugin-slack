@@ -234,22 +234,25 @@ async fn event_callback_runs_typed_handler_after_ack() {
 async fn ack_does_not_wait_for_slow_event_handler() {
     let t = MemoryTransport::new();
     let (tx, mut rx) = mpsc::unbounded_channel::<()>();
+    let gate = Gate::default();
+    let g = gate.clone();
     let client = app(plugin(&t).on_event("message", move |_ctx, _ev| {
-        let tx = tx.clone();
+        let (tx, g) = (tx.clone(), g.clone());
         async move {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            g.wait().await;
             tx.send(()).unwrap();
             Ok(())
         }
     }));
-    let start = std::time::Instant::now();
-    post_event(&client, &event_callback("Ev2", &json!({"type": "message"})))
-        .await
-        .assert_status(200);
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "ack waited for the handler"
-    );
+    // The gate is closed, so the handler cannot end. The ack must not wait.
+    within(post_event(
+        &client,
+        &event_callback("Ev2", &json!({"type": "message"})),
+    ))
+    .await
+    .assert_status(200);
+    assert!(rx.try_recv().is_err());
+    gate.open();
     recv(&mut rx).await;
 }
 
@@ -374,15 +377,27 @@ async fn command_in_channel_with_blocks_and_empty_ack() {
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_command_acks_then_posts_to_response_url() {
     let t = MemoryTransport::new();
-    let client = app(plugin(&t).command("/report", |_ctx, _cmd| async move {
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        Ok(CommandResponse::in_channel("Report ready"))
-    }));
-    let start = std::time::Instant::now();
-    let r = post_form(&client, "/slack/commands", &command_form("/report", "")).await;
+    let gate = Gate::default();
+    let g = gate.clone();
+    let client = app(
+        plugin_with(&t, slow_config()).command("/report", move |_ctx, _cmd| {
+            let g = g.clone();
+            async move {
+                g.wait().await;
+                Ok(CommandResponse::in_channel("Report ready"))
+            }
+        }),
+    );
+    let r = within(post_form(
+        &client,
+        "/slack/commands",
+        &command_form("/report", ""),
+    ))
+    .await;
     r.assert_status(200);
     assert_eq!(r.text(), "");
-    assert!(start.elapsed() < Duration::from_millis(550));
+    assert!(t.requests_to(RESPONSE_URL).is_empty());
+    gate.open();
     wait_until(Duration::from_secs(5), &|| {
         !t.requests_to(RESPONSE_URL).is_empty()
     })
@@ -455,13 +470,26 @@ async fn command_error_and_panic_give_error_text_not_500() {
 #[tokio::test(flavor = "multi_thread")]
 async fn late_command_error_posts_error_text() {
     let t = MemoryTransport::new();
-    let client = app(plugin(&t).command("/slowfail", |_ctx, _cmd| async move {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        Err::<CommandResponse, HandlerError>("late failure".into())
-    }));
-    post_form(&client, "/slack/commands", &command_form("/slowfail", ""))
-        .await
-        .assert_status(200);
+    let gate = Gate::default();
+    let g = gate.clone();
+    let client = app(
+        plugin_with(&t, slow_config()).command("/slowfail", move |_ctx, _cmd| {
+            let g = g.clone();
+            async move {
+                g.wait().await;
+                Err::<CommandResponse, HandlerError>("late failure".into())
+            }
+        }),
+    );
+    let r = within(post_form(
+        &client,
+        "/slack/commands",
+        &command_form("/slowfail", ""),
+    ))
+    .await;
+    r.assert_status(200);
+    assert_eq!(r.text(), "");
+    gate.open();
     wait_until(Duration::from_secs(5), &|| {
         !t.requests_to(RESPONSE_URL).is_empty()
     })
@@ -685,15 +713,25 @@ async fn unknown_interaction_and_bad_payload() {
 #[tokio::test(flavor = "multi_thread")]
 async fn slow_view_submission_acks_empty() {
     let t = MemoryTransport::new();
-    let client = app(plugin(&t).view_submission("slow", |_ctx, _v| async move {
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        Ok(ViewResponse::Clear)
-    }));
-    let start = std::time::Instant::now();
-    let r = post_interaction(&client, &view_payload("view_submission", "slow")).await;
+    let gate = Gate::default();
+    let g = gate.clone();
+    let client = app(
+        plugin_with(&t, slow_config()).view_submission("slow", move |_ctx, _v| {
+            let g = g.clone();
+            async move {
+                g.wait().await;
+                Ok(ViewResponse::Clear)
+            }
+        }),
+    );
+    let r = within(post_interaction(
+        &client,
+        &view_payload("view_submission", "slow"),
+    ))
+    .await;
     r.assert_status(200);
-    assert_eq!(r.text(), "");
-    assert!(start.elapsed() < Duration::from_millis(550));
+    assert_eq!(r.text(), "", "a late view reply is lost");
+    gate.open();
 }
 
 #[tokio::test(flavor = "multi_thread")]

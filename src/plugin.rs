@@ -11,7 +11,6 @@ use autumn_web::config::AutumnConfig;
 use autumn_web::plugin::Plugin;
 use autumn_web::plugin_contract::PluginContract;
 use autumn_web::reexports::axum::Router;
-use autumn_web::route_listing::{RouteClassification, RouteInfo};
 use autumn_web::time::{ClockSource, SystemClock};
 use autumn_web::webhook::{InMemoryWebhookReplayStore, WebhookReplayStore};
 use autumn_web::{AppState, AutumnError};
@@ -411,23 +410,6 @@ fn check_security(cfg: &AutumnConfig, base: &str) -> Result<(), SlackError> {
     Ok(())
 }
 
-/// Route metadata for `autumn routes`.
-fn route_infos(base: &str) -> Vec<RouteInfo> {
-    route_paths(base)
-        .into_iter()
-        .zip(["slack::events", "slack::commands", "slack::interactions"])
-        .map(|(path, handler)| RouteInfo {
-            method: "POST".to_owned(),
-            path,
-            handler: handler.to_owned(),
-            middleware: vec!["slack_signature".to_owned()],
-            // Public route: the Slack signature is the access control.
-            classification: RouteClassification::Public,
-            ..RouteInfo::default()
-        })
-        .collect()
-}
-
 /// A started plugin.
 pub struct SlackRuntime {
     engine: Arc<Engine>,
@@ -516,12 +498,11 @@ impl Plugin for SlackPlugin {
         let pending = Arc::new(Mutex::new(Some(self)));
         let (start_cell, stop_cell) = (Arc::clone(&cell), Arc::clone(&cell));
         let start_health = Arc::clone(&health);
-        let router = routes::router(&cell);
-        let app = app
-            .config_section(SECTION)
+        let routes = routes::autumn_routes(&cell, &base);
+        app.config_section(SECTION)
             .metrics_source("slack", metrics as Arc<dyn MetricsSource>)
             .health_indicator("slack", health as Arc<dyn HealthIndicator>)
-            .declare_plugin_routes(route_infos(&base))
+            .routes(routes)
             .on_startup(move |state| {
                 let plugin = pending
                     .lock()
@@ -546,12 +527,7 @@ impl Plugin for SlackPlugin {
                         drain(&engine).await;
                     }
                 }
-            });
-        if base.is_empty() {
-            app.merge(router)
-        } else {
-            app.nest(&base, router)
-        }
+            })
     }
 }
 

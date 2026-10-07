@@ -82,18 +82,24 @@ fn plugin_name_contract_and_config_section() {
 
 #[test]
 fn plugin_declares_its_routes() {
+    use autumn_web::route_listing::{RouteClassification, RouteSource};
     let app = autumn_web::app().plugin(SlackPlugin::new().base_path("/hooks/slack"));
     let routes = app.plugin_route_infos().unwrap();
-    let paths: Vec<_> = routes
-        .iter()
-        .map(|r| (r.method.as_str(), r.path.as_str()))
-        .collect();
     for p in [
         "/hooks/slack/events",
         "/hooks/slack/commands",
         "/hooks/slack/interactions",
     ] {
-        assert!(paths.contains(&("POST", p)), "{paths:?}");
+        let r = routes
+            .iter()
+            .find(|r| r.path == p)
+            .unwrap_or_else(|| panic!("no route {p}"));
+        assert_eq!(r.method, "POST");
+        assert_eq!(r.classification, RouteClassification::Public, "{p}");
+        assert_eq!(
+            r.source,
+            RouteSource::Plugin("autumn-plugin-slack".to_owned())
+        );
     }
 }
 
@@ -317,11 +323,13 @@ async fn shutdown_waits_for_in_flight_handlers() {
     let t = MemoryTransport::new();
     let done = Arc::new(AtomicU32::new(0));
     let d = Arc::clone(&done);
+    let gate = Gate::default();
+    let g = gate.clone();
     let rt = plugin(&t)
         .on_event("message", move |_ctx, _ev| {
-            let d = Arc::clone(&d);
+            let (d, g) = (Arc::clone(&d), g.clone());
             async move {
-                tokio::time::sleep(Duration::from_millis(300)).await;
+                g.wait().await;
                 d.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }
@@ -331,9 +339,17 @@ async fn shutdown_waits_for_in_flight_handlers() {
     let body = event_callback("EvDrain", &json!({"type": "message"})).to_string();
     let status = oneshot(&rt, "/events", &body).await;
     assert_eq!(status, 200);
+    // The gate is closed: the handler is in flight.
     assert_eq!(rt.in_flight(), 1);
+    assert_eq!(rt.metrics().in_flight(), 1);
+    // Open the gate a little after shutdown starts to wait.
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        gate.open();
+    });
     rt.shutdown().await;
     assert_eq!(done.load(Ordering::SeqCst), 1);
+    assert_eq!(rt.in_flight(), 0);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -101,6 +101,36 @@ proof fn lemma_backoff_monotonic(initial: int, attempt: int, cap: int)
     lemma_backoff_bounds(initial, attempt, cap);
 }
 
+/// Once the backoff reaches the cap, it stays at the cap.
+proof fn lemma_backoff_stays_at_cap(initial: int, i: int, j: int, cap: int)
+    requires
+        cap >= 0,
+        1 <= i <= j,
+        spec_backoff(initial, i, cap) == cap,
+    ensures
+        spec_backoff(initial, j, cap) == cap,
+    decreases j - i,
+{
+    if j > i {
+        lemma_backoff_stays_at_cap(initial, i, j - 1, cap);
+    }
+}
+
+/// Once the backoff is zero, it stays zero.
+proof fn lemma_backoff_stays_at_zero(initial: int, i: int, j: int, cap: int)
+    requires
+        cap >= 0,
+        1 <= i <= j,
+        spec_backoff(initial, i, cap) == 0,
+    ensures
+        spec_backoff(initial, j, cap) == 0,
+    decreases j - i,
+{
+    if j > i {
+        lemma_backoff_stays_at_zero(initial, i, j - 1, cap);
+    }
+}
+
 /// Returns the wait in ms before retry number `attempt` (1-based).
 pub fn backoff_ms(initial: u64, attempt: u32, cap: u64) -> (r: u64)
     ensures
@@ -118,6 +148,19 @@ pub fn backoff_ms(initial: u64, attempt: u32, cap: u64) -> (r: u64)
             b == spec_backoff(initial as int, i as int, cap as int),
         decreases attempt - i,
     {
+        // At the cap or at zero: stop early. A large `attempt` costs no time.
+        if b == cap {
+            proof {
+                lemma_backoff_stays_at_cap(initial as int, i as int, attempt as int, cap as int);
+            }
+            return b;
+        }
+        if b == 0 {
+            proof {
+                lemma_backoff_stays_at_zero(initial as int, i as int, attempt as int, cap as int);
+            }
+            return b;
+        }
         // Compare without overflow: `cap - b <= b` is `2b >= cap`.
         b = if cap - b <= b { cap } else { b * 2 };
         i = i + 1;

@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: rustfmt
+      - run: cargo fmt --check
+
+  clippy:
+    needs: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    needs: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.98.1
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Test with coverage (fail under 85% lines)
+        run: cargo llvm-cov --all-targets --fail-under-lines 85 --lcov --output-path lcov.info
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lcov
+          path: lcov.info
+
+  verus:
+    runs-on: ubuntu-latest
+    env:
+      # Same build as local: Verus from source at a pinned commit, z3 from PyPI.
+      VERUS_REV: 2c9bf54cfa6391ee3769f23d8d173b96a0b70560
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: verus-src/source/target-verus
+          key: verus-${{ env.VERUS_REV }}
+      - name: Build Verus
+        run: |
+          set -eu
+          mkdir -p verus-src && cd verus-src
+          git init -q
+          git fetch -q --depth 1 https://github.com/verus-lang/verus "$VERUS_REV"
+          git checkout -q FETCH_HEAD
+          pip download -q --no-deps z3-solver==4.16.0.0 -d /tmp/z3
+          python3 -m zipfile -e /tmp/z3/*.whl /tmp/z3/x
+          cp /tmp/z3/x/z3_solver-4.16.0.0.data/data/bin/z3 source/z3
+          chmod +x source/z3
+          cd source
+          rustup toolchain install
+          bash -c 'source ../tools/activate && vargo build --release'
+      - name: Verify policy spec
+        run: |
+          VERUS_Z3_PATH="$PWD/verus-src/source/z3" \
+            verus-src/source/target-verus/release/verus verus/policy.rs
