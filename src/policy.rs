@@ -72,8 +72,8 @@ pub struct RetryRule {
 
 /// Decides the next step after attempt number `attempt` (1-based).
 ///
-/// - 429: retry after `Retry-After` while attempts are left and the wait is
-///   in the cap.
+/// - 429: retry after `Retry-After` if attempts remain and the wait is not
+///   more than the cap.
 /// - 5xx and network errors: retry with backoff only when `idempotent`.
 /// - Other outcomes: done.
 #[must_use]
@@ -141,6 +141,59 @@ mod tests {
             "pub const DEFAULT_RETRY_AFTER_MS: u64 = 1_000;",
         ] {
             assert!(spec.contains(line), "verus/policy.rs lacks {line}");
+        }
+    }
+
+    /// The `{ ... }` block that starts at the last `start` before `anchor`,
+    /// with no whitespace and no optional comma near `}` or `)`.
+    fn block(src: &str, start: &str, anchor: &str) -> String {
+        let at = src.find(anchor).unwrap_or_else(|| panic!("no {anchor}"));
+        let from = src[..at + anchor.len()]
+            .rfind(start)
+            .unwrap_or_else(|| panic!("no {start}"));
+        let open = from + src[from..].find('{').unwrap();
+        let mut depth = 0;
+        let mut end = open;
+        for (i, c) in src[open..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 {
+                end = open + i;
+                break;
+            }
+        }
+        let flat: String = src[open..=end]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        flat.replace(",}", "}")
+            .replace(",)", ")")
+            .replace("},", "}")
+    }
+
+    #[test]
+    fn verus_bodies_match() {
+        let spec = include_str!("../verus/policy.rs");
+        let code = include_str!("policy.rs");
+        // `decide` and `retry_after_ms` have no proof code: the text must match.
+        for (start, anchor) in [
+            (
+                "match outcome {",
+                "Outcome::Success | Outcome::ClientError => Step::Done",
+            ),
+            (
+                "if secs <= u64::MAX / 1000 {",
+                "if secs <= u64::MAX / 1000 {",
+            ),
+        ] {
+            assert_eq!(
+                block(spec, start, anchor),
+                block(code, start, anchor),
+                "{start}"
+            );
         }
     }
 
@@ -221,7 +274,19 @@ mod tests {
             cap in 0u64..10_000,
         ) {
             let rule = RetryRule { max_attempts, initial_backoff_ms: init, max_wait_ms: cap };
-            match decide(o, attempt, idem, ra, &rule) {
+            let step = decide(o, attempt, idem, ra, &rule);
+            // A 429 with attempts left and a wait not over the cap retries after
+            // exactly the Slack wait.
+            let wait = ra.unwrap_or(DEFAULT_RETRY_AFTER_MS);
+            if o == Outcome::RateLimited && attempt < max_attempts && wait <= cap {
+                prop_assert_eq!(step, Step::Retry(wait));
+            }
+            // A read call with attempts left retries a 5xx or network error
+            // after exactly the capped backoff.
+            if matches!(o, Outcome::ServerError | Outcome::NetworkError) && idem && attempt < max_attempts {
+                prop_assert_eq!(step, Step::Retry(backoff_ms(init, attempt, cap)));
+            }
+            match step {
                 Step::Retry(w) => {
                     prop_assert!(attempt < max_attempts);
                     prop_assert!(w <= cap);

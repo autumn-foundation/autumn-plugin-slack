@@ -114,6 +114,8 @@ async fn health_check_is_single_flight_and_one_attempt() {
         "auth.test",
         HttpReply::json(429, &json!({"ok": false})).retry_after(30),
     );
+    // A slow reply, so the ten probes overlap.
+    t.set_latency(Duration::from_millis(50));
     let rt = plugin(&t).start(&AppState::for_test()).unwrap();
     let h = rt.health();
     let outs = futures::future::join_all((0..10).map(|_| h.check())).await;

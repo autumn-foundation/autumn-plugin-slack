@@ -122,7 +122,8 @@ impl SlackPlugin {
         self
     }
 
-    /// Puts the health indicator in `/ready` too. Default: `/health` only.
+    /// Puts the health indicator in `/ready` too. Default: only in
+    /// `/actuator/health`.
     #[must_use]
     pub const fn readiness(mut self, on: bool) -> Self {
         self.readiness = on;
@@ -601,6 +602,37 @@ fn shutdown_hook(cell: &EngineCell) -> impl Future<Output = ()> + Send + use<> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_hook_drains_the_started_engine() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // No engine: the hook ends at once.
+        shutdown_hook(&Arc::new(OnceLock::new())).await;
+        let rt = SlackPlugin::with_config(SlackConfig::default())
+            .with_signing_secret("s")
+            .with_transport(crate::transport::MemoryTransport::new())
+            .start(&AppState::for_test())
+            .unwrap();
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let done = Arc::new(AtomicBool::new(false));
+        let (g, d) = (Arc::clone(&gate), Arc::clone(&done));
+        rt.engine.runner.spawn_task(async move {
+            g.notified().await;
+            d.store(true, Ordering::SeqCst);
+        });
+        let cell: EngineCell = Arc::new(OnceLock::new());
+        let _ = cell.set(Arc::clone(&rt.engine));
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            gate.notify_one();
+        });
+        shutdown_hook(&cell).await;
+        assert!(
+            done.load(Ordering::SeqCst),
+            "the hook did not wait for the task"
+        );
+        assert!(rt.engine.runner.tracker.is_closed());
+    }
 
     #[test]
     fn base_path_normalizes() {

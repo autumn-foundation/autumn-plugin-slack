@@ -78,7 +78,9 @@ fn fake_slack(seen: &Seen) -> Router {
 fn cfg(base: &str) -> SlackConfig {
     let mut c = config();
     base.clone_into(&mut c.api_base_url);
-    c.api.timeout_ms = 300;
+    // Wide: a write is not retried after a timeout, so a slow CI box must
+    // not hit it. The timeout test sets its own short limit.
+    c.api.timeout_ms = 10_000;
     c
 }
 
@@ -110,7 +112,9 @@ async fn real_http_round_trip_with_429_retry() {
 async fn real_http_timeout_is_transport_error() {
     let seen = Seen::default();
     let base = serve(fake_slack(&seen)).await;
-    let rt = SlackPlugin::with_config(cfg(&base))
+    let mut c = cfg(&base);
+    c.api.timeout_ms = 300;
+    let rt = SlackPlugin::with_config(c)
         .with_signing_secret(SECRET)
         .with_bot_token(TOKEN)
         .start(&AppState::for_test())

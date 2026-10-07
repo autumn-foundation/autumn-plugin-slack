@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 use autumn_plugin_slack::{SlackPlugin, testing};
 
 const SECRET: &str = "boot-test-secret";
+const OLD_SECRET: &str = "boot-test-old-secret";
 const CHILD_MARK: &str = "SLACK_BOOT_TEST_CHILD";
 
 /// The server. It runs only in the child process.
@@ -52,6 +53,12 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
             .env("AUTUMN_SERVER__PORT", port.to_string())
             .env("AUTUMN_SERVER__HOST", "127.0.0.1")
             .env("SLACK_SIGNING_SECRET", SECRET)
+            // Rotation: the old secret comes from a named env var.
+            .env(
+                "AUTUMN_SLACK__PREVIOUS_SIGNING_SECRET_ENVS",
+                "SLACK_BOOT_OLD_SECRET",
+            )
+            .env("SLACK_BOOT_OLD_SECRET", OLD_SECRET)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -60,8 +67,20 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
     let body = r#"{"type":"url_verification","challenge":"boot"}"#;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://127.0.0.1:{port}/slack/events");
+    let signed_post = |secret: &'static str| {
+        let ts = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
+        let [(h1, v1), (h2, v2)] = testing::signed_headers(secret, ts, body.as_bytes());
+        client
+            .post(&url)
+            .header(h1, v1)
+            .header(h2, v2)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+    };
+    // Wait for the app to boot.
     let start = Instant::now();
-    loop {
+    let first = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             let mut err = String::new();
             if let Some(mut e) = child.0.stderr.take() {
@@ -73,21 +92,20 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
             start.elapsed() < Duration::from_secs(60),
             "the app did not answer"
         );
-        let ts = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
-        let [(h1, v1), (h2, v2)] = testing::signed_headers(SECRET, ts, body.as_bytes());
-        if let Ok(res) = client
-            .post(&url)
-            .header(h1, v1)
-            .header(h2, v2)
-            .header("content-type", "application/json")
-            .body(body)
-            .send()
-            .await
-        {
-            assert_eq!(res.status().as_u16(), 200);
-            assert!(res.text().await.unwrap().contains("boot"));
-            break;
+        if let Ok(res) = signed_post(SECRET).await {
+            break res;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    };
+    assert_eq!(first.status().as_u16(), 200);
+    assert!(first.text().await.unwrap().contains("boot"));
+    // Rotation: the old secret from the named env var also verifies.
+    assert_eq!(
+        signed_post(OLD_SECRET).await.unwrap().status().as_u16(),
+        200
+    );
+    assert_eq!(
+        signed_post("not-a-secret").await.unwrap().status().as_u16(),
+        401
+    );
 }

@@ -51,7 +51,7 @@ pub struct SlackConfig {
     pub max_body_bytes: usize,
     /// Time to remember an event ID, to drop Slack retries.
     pub dedup_window_secs: u64,
-    /// Time to wait for in-flight handlers at shutdown.
+    /// Time to wait for running handlers at shutdown.
     pub drain_timeout_secs: u64,
     /// Reply text when a command handler fails. No error detail goes to Slack.
     pub error_text: String,
@@ -404,7 +404,7 @@ fn insert_path(table: &mut toml::Table, path: &[String], value: toml::Value) {
     cur.insert(last.clone(), value);
 }
 
-/// Types an env value like the default value at the same path. A list is a
+/// Converts an env value to the type of the default at the same path. A list is a
 /// comma-separated string.
 fn typed_env_value(schema: &toml::Table, path: &[String], raw: &str) -> Option<toml::Value> {
     let mut node: Option<&toml::Value> = None;

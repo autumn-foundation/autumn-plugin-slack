@@ -7,7 +7,7 @@
 
 All Slack Web API calls are HTTP `POST`. Slack replies 429 with
 `Retry-After` when an app sends too many calls. A 429 means Slack did not
-do the call. A 5xx or a lost connection can mean Slack did the call.
+do the call. After a 5xx or a connection failure, Slack possibly did the call.
 
 autumn-web 0.8 has `http_client::Client`. By default it retries only
 idempotent HTTP methods. It does not retry `POST`.
@@ -42,12 +42,23 @@ Option 2.
 
 ## Ack strategy
 
-Slack wants a reply in 3 s.
+Slack must get a reply in 3 s.
 
 - Events, actions, view closes, shortcuts: the reply has no content. The
   plugin acks at once and runs the handler in the background.
 - Commands and view submissions: the reply has content. The plugin waits up
-  to `ack_timeout_ms`. A late command reply goes to `response_url`. A late
-  view reply is lost; Slack closes the view.
-- Background handlers are tracked. Shutdown waits for them up to
-  `drain_timeout_secs`. They are not durable: use `#[job]` for that.
+  to `ack_timeout_ms`. A late command reply goes to `response_url`. Slack
+  does not get a late view reply. Slack closes the view.
+- One tracked task owns the ack wait. If the request is gone, that task
+  still sends the late reply.
+- The plugin tracks background handlers. At shutdown, the routes reply 503
+  and the plugin waits for handlers up to `drain_timeout_secs`. A restart
+  stops background handlers: use `#[job]` for durable work.
+
+## Retry budget
+
+The longest call is about `max_attempts × timeout_ms + (max_attempts − 1) ×
+max_wait_ms` (default about 90 s). This is longer than the drain. Shutdown
+can stop a call that waits for a retry. Calls with a `trigger_id` wait 1 s
+or less, because the trigger is valid for 3 s only. The health check makes
+one attempt.

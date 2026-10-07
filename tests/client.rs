@@ -251,7 +251,7 @@ async fn paginate_stops_at_max_pages() {
 #[tokio::test]
 async fn missing_token_gives_config_error() {
     let t = MemoryTransport::new();
-    let rt = autumn_plugin_slack::SlackPlugin::with_config(config())
+    let rt = autumn_plugin_slack::SlackPlugin::with_config(no_token_config())
         .with_signing_secret(SECRET)
         .with_transport(t.clone())
         .start(&AppState::for_test())

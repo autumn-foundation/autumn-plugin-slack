@@ -211,10 +211,12 @@ impl RecordedRequest {
 #[derive(Default)]
 struct MemoryInner {
     requests: Vec<RecordedRequest>,
-    /// Pattern to replies. The last reply repeats.
+    /// Replies for each pattern. The last reply repeats.
     replies: HashMap<String, VecDeque<HttpReply>>,
-    /// Pattern to the count of network errors to give first.
+    /// Number of network errors to give for each pattern before a reply.
     failures: HashMap<String, u32>,
+    /// Wait before each reply.
+    latency: Duration,
 }
 
 /// In-memory fake transport for tests.
@@ -250,6 +252,12 @@ impl MemoryTransport {
         self.lock()
             .replies
             .insert(pattern.to_owned(), replies.into());
+    }
+
+    /// Waits `latency` before each reply. Use it to test slow or concurrent
+    /// calls. Default: no wait.
+    pub fn set_latency(&self, latency: Duration) {
+        self.lock().latency = latency;
     }
 
     /// Gives a network error to the next `count` requests that match.
@@ -316,6 +324,10 @@ fn matches(url: &str, pattern: &str) -> bool {
 impl HttpTransport for MemoryTransport {
     fn post(&self, req: HttpRequest) -> BoxFuture<'_, Result<HttpReply, TransportError>> {
         Box::pin(async move {
+            let latency = self.lock().latency;
+            if !latency.is_zero() {
+                tokio::time::sleep(latency).await;
+            }
             let reply = self.reply_for(&req.url);
             self.lock().requests.push(RecordedRequest {
                 url: req.url,

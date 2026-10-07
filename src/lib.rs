@@ -1,6 +1,6 @@
 //! Slack plugin for autumn-web.
 //!
-//! - **Inbound:** verified Events API, slash commands, and interactivity
+//! - **Inbound:** signature-checked Events API, slash commands, and interactivity
 //!   routes. Handlers by event type, command, `action_id`, or `callback_id`.
 //! - **Outbound:** a Web API client with retry rules, and `response_url`
 //!   replies.

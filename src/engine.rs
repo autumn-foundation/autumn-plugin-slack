@@ -227,16 +227,15 @@ impl Engine {
         let ack = self.ack_timeout();
         let metrics = Arc::clone(&self.metrics);
         self.runner.spawn_task(async move {
-            let res = match tokio::time::timeout(ack, &mut handle).await {
-                Ok(done) => match tx.send(finished_ok(done)) {
+            let res = if let Ok(done) = tokio::time::timeout(ack, &mut handle).await {
+                match tx.send(finished_ok(done)) {
                     Ok(()) => return,
                     // The request is gone. Use the late path.
                     Err(res) => res,
-                },
-                Err(_) => {
-                    drop(tx);
-                    finished_ok(handle.await)
                 }
+            } else {
+                drop(tx);
+                finished_ok(handle.await)
             };
             metrics.late_ack(surface);
             late(res).await;

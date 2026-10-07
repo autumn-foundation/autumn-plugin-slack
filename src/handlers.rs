@@ -198,7 +198,7 @@ impl Runner {
     {
         let guard = InFlight::new(Arc::clone(&self.metrics));
         self.tracker.spawn(async move {
-            // The call is in the block, so a panic before the first poll is caught too.
+            // `catch_unwind` also catches a panic before the first poll.
             let out = AssertUnwindSafe(async move { handler(ctx, payload).await })
                 .catch_unwind()
                 .await;
@@ -229,7 +229,7 @@ impl Runner {
     }
 }
 
-/// Counts one running handler. The drop also runs when the task is aborted.
+/// Counts one handler that runs. `drop` also runs when the task aborts.
 struct InFlight {
     metrics: Arc<SlackMetrics>,
 }
