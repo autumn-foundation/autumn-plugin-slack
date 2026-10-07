@@ -10,8 +10,12 @@ use crate::config::SlackConfig;
 use crate::error::SlackError;
 use crate::metrics::SlackMetrics;
 use crate::payload::Message;
-use crate::policy::{Outcome, Step, decide, retry_after_ms};
+use crate::policy::{Outcome, RetryRule, Step, decide, retry_after_ms};
 use crate::transport::{HttpReply, HttpRequest, HttpTransport, TransportError};
+
+/// Largest 429 wait for a call with a `trigger_id`. A trigger is valid for
+/// 3 s only, so a longer wait gives `expired_trigger_id`.
+const TRIGGER_MAX_WAIT_MS: u64 = 1_000;
 
 /// Metrics label for `response_url` posts.
 const RESPONSE_URL_LABEL: &str = "response_url";
@@ -54,7 +58,7 @@ struct Inner {
     metrics: Arc<SlackMetrics>,
 }
 
-/// Slack Web API client. Cheap to clone.
+/// Slack Web API client. A clone shares one connection pool.
 ///
 /// Get it from a handler with [`crate::SlackContext::client`], or from the
 /// app state with [`SlackClient::from_state`].
@@ -103,14 +107,14 @@ impl SlackClient {
 
     /// Calls a write method. It retries only on 429.
     ///
-    /// `params` is a JSON object. Strings go as they are. Other values go as
-    /// JSON text. `null` values are left out.
+    /// `params` is a JSON object. The client sends strings unchanged and other
+    /// values as JSON text. It does not send `null` values.
     ///
     /// # Errors
     /// Returns [`SlackError::Api`] for `ok: false`, or a transport, HTTP,
     /// rate-limit, decode, or config error.
     pub async fn call(&self, method: &str, params: &Value) -> Result<Value, SlackError> {
-        self.call_with(method, params, false).await
+        self.call_with(method, params, false, self.rule()).await
     }
 
     /// Calls a read method. It also retries on 5xx and network errors.
@@ -118,7 +122,19 @@ impl SlackClient {
     /// # Errors
     /// Same as [`Self::call`].
     pub async fn call_read(&self, method: &str, params: &Value) -> Result<Value, SlackError> {
-        self.call_with(method, params, true).await
+        self.call_with(method, params, true, self.rule()).await
+    }
+
+    /// The retry rule from the config.
+    fn rule(&self) -> RetryRule {
+        self.inner.config.api.rule()
+    }
+
+    /// The rule for calls with a `trigger_id`: a short wait cap.
+    fn trigger_rule(&self) -> RetryRule {
+        let mut r = self.rule();
+        r.max_wait_ms = r.max_wait_ms.min(TRIGGER_MAX_WAIT_MS);
+        r
     }
 
     async fn call_with(
@@ -126,6 +142,7 @@ impl SlackClient {
         method: &str,
         params: &Value,
         idempotent: bool,
+        rule: RetryRule,
     ) -> Result<Value, SlackError> {
         if !valid_method(method) {
             return Err(SlackError::Config(format!(
@@ -145,7 +162,6 @@ impl SlackClient {
         };
         let url = format!("{}{method}", self.inner.config.api_base_url);
         let body = form_body(map).into_bytes();
-        let rule = self.inner.config.api.rule();
         let mut attempt: u32 = 1;
         loop {
             let req = HttpRequest::new(url.as_str())
@@ -226,7 +242,9 @@ impl SlackClient {
         params: Value,
         idempotent: bool,
     ) -> Result<T, SlackError> {
-        let v = self.call_with(method, &params, idempotent).await?;
+        let v = self
+            .call_with(method, &params, idempotent, self.rule())
+            .await?;
         T::deserialize(&v).map_err(|e| SlackError::Decode(format!("{method}: {e}")))
     }
 
@@ -318,14 +336,12 @@ impl SlackClient {
     /// # Errors
     /// Same as [`Self::call`].
     pub async fn views_open(&self, trigger_id: &str, view: &Value) -> Result<Value, SlackError> {
-        self.view_call(
-            "views.open",
-            serde_json::json!({"trigger_id": trigger_id, "view": view}),
-        )
-        .await
+        let p = serde_json::json!({"trigger_id": trigger_id, "view": view});
+        self.view_call("views.open", p, self.trigger_rule()).await
     }
 
-    /// `views.update`. `hash` prevents a lost update. Returns the view.
+    /// `views.update`. `hash` stops an update that would overwrite a newer
+    /// view. Returns the view.
     ///
     /// # Errors
     /// Same as [`Self::call`].
@@ -336,7 +352,7 @@ impl SlackClient {
         hash: Option<&str>,
     ) -> Result<Value, SlackError> {
         let p = serde_json::json!({"view_id": view_id, "view": view, "hash": hash});
-        self.view_call("views.update", p).await
+        self.view_call("views.update", p, self.rule()).await
     }
 
     /// `views.push`. Returns the view.
@@ -344,11 +360,8 @@ impl SlackClient {
     /// # Errors
     /// Same as [`Self::call`].
     pub async fn views_push(&self, trigger_id: &str, view: &Value) -> Result<Value, SlackError> {
-        self.view_call(
-            "views.push",
-            serde_json::json!({"trigger_id": trigger_id, "view": view}),
-        )
-        .await
+        let p = serde_json::json!({"trigger_id": trigger_id, "view": view});
+        self.view_call("views.push", p, self.trigger_rule()).await
     }
 
     /// `views.publish` for the Home tab. Returns the view.
@@ -356,16 +369,18 @@ impl SlackClient {
     /// # Errors
     /// Same as [`Self::call`].
     pub async fn views_publish(&self, user_id: &str, view: &Value) -> Result<Value, SlackError> {
-        self.view_call(
-            "views.publish",
-            serde_json::json!({"user_id": user_id, "view": view}),
-        )
-        .await
+        let p = serde_json::json!({"user_id": user_id, "view": view});
+        self.view_call("views.publish", p, self.rule()).await
     }
 
     /// Calls a `views.*` write method. Returns the `view` field.
-    async fn view_call(&self, method: &str, params: Value) -> Result<Value, SlackError> {
-        let mut v = self.call(method, &params).await?;
+    async fn view_call(
+        &self,
+        method: &str,
+        params: Value,
+        rule: RetryRule,
+    ) -> Result<Value, SlackError> {
+        let mut v = self.call_with(method, &params, false, rule).await?;
         Ok(v.get_mut("view").map(Value::take).unwrap_or_default())
     }
 
@@ -387,6 +402,16 @@ impl SlackClient {
     pub async fn auth_test(&self) -> Result<AuthTest, SlackError> {
         self.call_as("auth.test", Value::Object(Map::new()), true)
             .await
+    }
+
+    /// `auth.test` with one attempt, for the health check. A 429 gives
+    /// `RateLimited` at once, not a long wait.
+    pub(crate) async fn auth_test_once(&self) -> Result<(), SlackError> {
+        let mut rule = self.rule();
+        rule.max_attempts = 1;
+        self.call_with("auth.test", &Value::Object(Map::new()), true, rule)
+            .await
+            .map(drop)
     }
 
     /// Calls a read method once per page and joins the `key` arrays.
@@ -531,7 +556,7 @@ pub(crate) fn form_body(params: &Map<String, Value>) -> String {
             Some((k.as_str(), text))
         })
         .collect();
-    // Pairs of strings always encode.
+    // String pairs cannot fail to encode.
     serde_urlencoded::to_string(pairs).unwrap_or_default()
 }
 

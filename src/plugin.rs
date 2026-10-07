@@ -13,7 +13,7 @@ use autumn_web::plugin_contract::PluginContract;
 use autumn_web::reexports::axum::Router;
 use autumn_web::time::{ClockSource, SystemClock};
 use autumn_web::webhook::{InMemoryWebhookReplayStore, WebhookReplayStore};
-use autumn_web::{AppState, AutumnError};
+use autumn_web::{AppState, AutumnError, ProcessRole};
 use tokio_util::task::TaskTracker;
 
 use crate::client::SlackClient;
@@ -271,13 +271,29 @@ impl SlackPlugin {
     /// # Errors
     /// Returns a config error.
     pub fn start(self, state: &AppState) -> Result<SlackRuntime, SlackError> {
-        let health = Arc::new(SlackHealth::new(self.readiness));
-        self.start_inner(state, health)
+        let role = state.role();
+        self.start_with_role(state, role)
     }
 
+    /// Starts the plugin as if the process has `role`. A role that serves no
+    /// HTTP (`worker`) needs no signing secret and no CSRF exemption.
+    ///
+    /// # Errors
+    /// Same as [`Self::start`].
+    pub fn start_with_role(
+        self,
+        state: &AppState,
+        role: ProcessRole,
+    ) -> Result<SlackRuntime, SlackError> {
+        let health = Arc::new(SlackHealth::new(self.readiness));
+        self.start_inner(state, role, health)
+    }
+
+    #[allow(clippy::too_many_lines)] // One linear setup sequence.
     fn start_inner(
         self,
         state: &AppState,
+        role: ProcessRole,
         health: Arc<SlackHealth>,
     ) -> Result<SlackRuntime, SlackError> {
         let config = match self.config {
@@ -286,19 +302,32 @@ impl SlackPlugin {
             None => SlackConfig::load(Some(state.profile()).filter(|p| *p != "default"))?,
         };
         config.validate()?;
-        check_security(&state.config(), &self.base_path)?;
+        // A worker serves no Slack route, so it needs no inbound checks.
+        let inbound = role.serves_http();
+        if inbound {
+            check_security(&state.config(), &self.base_path)?;
+        }
         let registry = Registry::build(self.registrations)?;
         let secret = self
             .signing_secret
             .or_else(|| env_var(&config.signing_secret_env))
-            .filter(|s| !s.trim().is_empty())
-            .ok_or_else(|| {
-                SlackError::Config(format!(
+            .filter(|s| !s.trim().is_empty());
+        let secret = match secret {
+            Some(s) => s,
+            None if !inbound => String::new(),
+            None => {
+                return Err(SlackError::Config(format!(
                     "no signing secret; set the env var {}",
                     config.signing_secret_env
-                ))
-            })?;
-        let mut previous = self.previous_secrets;
+                )));
+            }
+        };
+        // An empty secret would let anyone sign. `Verifier` drops it too.
+        let mut previous: Vec<String> = self
+            .previous_secrets
+            .into_iter()
+            .filter(|s| !s.trim().is_empty())
+            .collect();
         for name in &config.previous_signing_secret_envs {
             if let Some(v) = env_var(name).filter(|s| !s.trim().is_empty()) {
                 previous.push(v);
@@ -374,8 +403,7 @@ fn is_exempt(path: &str, exempt: &[String]) -> bool {
     exempt.iter().any(|p| {
         let p = p.as_str();
         path == p
-            || (!p.is_empty()
-                && path.starts_with(p)
+            || (path.starts_with(p)
                 && (p.ends_with('/') || path.as_bytes().get(p.len()) == Some(&b'/')))
     })
 }
@@ -383,7 +411,12 @@ fn is_exempt(path: &str, exempt: &[String]) -> bool {
 /// Fails when CSRF or CAPTCHA would block the Slack routes. A plugin cannot
 /// add an exemption, so the error gives the config fix.
 fn check_security(cfg: &AutumnConfig, base: &str) -> Result<(), SlackError> {
-    let shown = if base.is_empty() { "/" } else { base };
+    // At the root, name the exact paths: "/" would exempt the whole app.
+    let fix = if base.is_empty() {
+        format!("{:?}", route_paths(base))
+    } else {
+        format!("[\"{base}\"]")
+    };
     let mut csrf_exempt = cfg.security.csrf.exempt_paths.clone();
     csrf_exempt.extend(
         cfg.security
@@ -392,18 +425,31 @@ fn check_security(cfg: &AutumnConfig, base: &str) -> Result<(), SlackError> {
             .iter()
             .map(|e| e.path.clone()),
     );
-    for path in route_paths(base) {
-        if cfg.security.csrf.enabled && !is_exempt(&path, &csrf_exempt) {
+    let [events, commands, interactions] = route_paths(base);
+    for path in [&events, &commands, &interactions] {
+        if cfg.security.csrf.enabled && !is_exempt(path, &csrf_exempt) {
             return Err(SlackError::Config(format!(
                 "CSRF protection blocks {path}. Slack sends no CSRF token. \
-                 Add \"{shown}\" to [security.csrf] exempt_paths. \
+                 Add {fix} to [security.csrf] exempt_paths. \
                  The Slack signature check protects these routes."
             )));
         }
-        if cfg.bot_protection.enabled && !is_exempt(&path, &cfg.security.captcha_exempt_paths) {
+    }
+    // autumn checks CAPTCHA only on form bodies, and not with `dev_bypass`.
+    let bot = &cfg.bot_protection;
+    let mut captcha_exempt = cfg.security.captcha_exempt_paths.clone();
+    captcha_exempt.extend(
+        cfg.security
+            .webhooks
+            .endpoints
+            .iter()
+            .map(|e| e.path.clone()),
+    );
+    for path in [&commands, &interactions] {
+        if bot.enabled && !bot.dev_bypass && !is_exempt(path, &captcha_exempt) {
             return Err(SlackError::Config(format!(
                 "Bot protection blocks {path}. Slack sends no CAPTCHA token. \
-                 Add \"{shown}\" to [security] captcha_exempt_paths."
+                 Add {fix} to [security] captcha_exempt_paths."
             )));
         }
     }
@@ -443,10 +489,10 @@ impl SlackRuntime {
         Arc::clone(&self.health)
     }
 
-    /// Handlers that run now.
+    /// Handlers that run now. Reply tasks do not count.
     #[must_use]
-    pub fn in_flight(&self) -> usize {
-        self.engine.runner.tracker.len()
+    pub fn in_flight(&self) -> u64 {
+        self.engine.metrics.in_flight()
     }
 
     /// The three routes, relative to the base path. Use it in tests, or to
@@ -457,8 +503,12 @@ impl SlackRuntime {
         routes::router(&cell)
     }
 
-    /// Stops new handler runs and waits for in-flight handlers, up to
-    /// `drain_timeout_secs`.
+    /// Stops new handler runs and waits for running handlers, up to
+    /// `drain_timeout_secs`. After this, the routes reply 503.
+    ///
+    /// In an app, autumn calls this at shutdown. autumn gives all shutdown
+    /// hooks `[server] shutdown_timeout_secs` in total, so the wait can be
+    /// shorter than `drain_timeout_secs`.
     pub async fn shutdown(&self) {
         drain(&self.engine).await;
     }
@@ -495,39 +545,56 @@ impl Plugin for SlackPlugin {
         let cell: EngineCell = Arc::new(OnceLock::new());
         let health = Arc::new(SlackHealth::new(self.readiness));
         let metrics = Arc::clone(&self.metrics);
-        let pending = Arc::new(Mutex::new(Some(self)));
-        let (start_cell, stop_cell) = (Arc::clone(&cell), Arc::clone(&cell));
-        let start_health = Arc::clone(&health);
+        let failure: Arc<Mutex<Option<SlackError>>> = Arc::default();
         let routes = routes::autumn_routes(&cell, &base);
+        let (init_cell, init_health, init_failure) =
+            (Arc::clone(&cell), Arc::clone(&health), Arc::clone(&failure));
+        let (check_cell, stop_cell) = (Arc::clone(&cell), Arc::clone(&cell));
         app.config_section(SECTION)
             .metrics_source("slack", metrics as Arc<dyn MetricsSource>)
             .health_indicator("slack", health as Arc<dyn HealthIndicator>)
             .routes(routes)
-            .on_startup(move |state| {
-                let plugin = pending
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take();
-                let (cell, health) = (Arc::clone(&start_cell), Arc::clone(&start_health));
-                async move {
-                    let Some(plugin) = plugin else {
-                        return Ok(());
-                    };
-                    let rt = plugin
-                        .start_inner(&state, health)
-                        .map_err(AutumnError::internal_server_error)?;
-                    let _ = cell.set(rt.engine);
-                    Ok(())
-                }
-            })
-            .on_shutdown(move || {
-                let engine = stop_cell.get().cloned();
-                async move {
-                    if let Some(engine) = engine {
-                        drain(&engine).await;
+            // Start before job workers, so a `#[job]` can use `SlackClient::from_state`.
+            .state_initializer(move |state| {
+                match self.start_inner(state, state.role(), init_health) {
+                    Ok(rt) => {
+                        let _ = init_cell.set(rt.engine);
+                    }
+                    Err(e) => {
+                        *init_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
                     }
                 }
             })
+            // An initializer cannot fail the boot. This hook reports its error.
+            .on_startup(move |_state| {
+                let failed = failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                let started = check_cell.get().is_some();
+                async move {
+                    match failed {
+                        Some(e) => Err(AutumnError::internal_server_error(e)),
+                        None if !started => Err(AutumnError::internal_server_error(
+                            SlackError::Config("the slack plugin did not start".to_owned()),
+                        )),
+                        None => Ok(()),
+                    }
+                }
+            })
+            .on_shutdown(move || shutdown_hook(&stop_cell))
+    }
+}
+
+/// The autumn shutdown hook: drain the started engine, if any.
+fn shutdown_hook(cell: &EngineCell) -> impl Future<Output = ()> + Send + use<> {
+    let engine = cell.get().cloned();
+    async move {
+        if let Some(engine) = engine {
+            drain(&engine).await;
+        }
     }
 }
 
@@ -551,7 +618,8 @@ mod tests {
         assert!(is_exempt("/slack/events", &ex(&["/slack/events"])));
         assert!(!is_exempt("/slack/events", &ex(&["/sla"])));
         assert!(!is_exempt("/slack/events", &ex(&["/slack/e"])));
-        assert!(!is_exempt("/slack/events", &ex(&[""])));
+        // Like autumn: an empty entry exempts all paths.
+        assert!(is_exempt("/slack/events", &ex(&[""])));
     }
 
     #[test]

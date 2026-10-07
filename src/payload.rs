@@ -1,7 +1,8 @@
 //! Typed Slack payloads and replies.
 //!
-//! Each payload keeps the raw JSON in `payload` (or `event`), so a handler
-//! can read fields that the typed view does not have.
+//! `EventCallback` (in `event`), `BlockAction`, `ViewPayload`, and `Shortcut`
+//! (in `payload`) keep the raw JSON. A handler can read fields that the
+//! typed view does not have.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +31,9 @@ pub struct EventCallback {
     /// `X-Slack-Retry-Num` of this delivery. `None` on the first delivery.
     #[serde(skip)]
     pub retry_num: Option<u32>,
+    /// `X-Slack-Retry-Reason`, for example `http_timeout`.
+    #[serde(skip)]
+    pub retry_reason: Option<String>,
 }
 
 impl EventCallback {
@@ -398,7 +402,9 @@ pub(crate) enum Interaction {
     ViewSubmission(ViewPayload),
     ViewClosed(ViewPayload),
     Shortcut(Shortcut),
-    /// A type with no support, for example `block_suggestion`.
+    /// `block_suggestion`: options load. Not in scope; the reply is no options.
+    BlockSuggestion,
+    /// A type with no support.
     Other,
 }
 
@@ -407,7 +413,9 @@ impl Interaction {
     pub(crate) fn parse(payload: Value) -> Option<Self> {
         let kind = payload.get("type")?.as_str()?.to_owned();
         let user_id = str_at(&payload, &["user", "id"]);
-        let team_id = str_at(&payload, &["team", "id"]);
+        // In an org-wide install, `team` can be null. Then `user.team_id` has the ID.
+        let team_id =
+            str_at(&payload, &["team", "id"]).or_else(|| str_at(&payload, &["user", "team_id"]));
         let trigger_id = str_at(&payload, &["trigger_id"]);
         let response_url = str_at(&payload, &["response_url"]);
         let channel_id = str_at(&payload, &["channel", "id"]);
@@ -469,6 +477,7 @@ impl Interaction {
                 response_url,
                 payload,
             })),
+            "block_suggestion" => Some(Self::BlockSuggestion),
             _ => Some(Self::Other),
         }
     }
@@ -577,8 +586,18 @@ mod tests {
         ));
         assert!(matches!(
             Interaction::parse(json!({"type": "block_suggestion"})),
+            Some(Interaction::BlockSuggestion)
+        ));
+        assert!(matches!(
+            Interaction::parse(json!({"type": "new_kind"})),
             Some(Interaction::Other)
         ));
+        // Org-wide install: `team` is null.
+        let p = json!({"type": "view_closed", "team": null, "user": {"id": "U", "team_id": "T9"}, "view": {"callback_id": "c"}});
+        let Some(Interaction::ViewClosed(v)) = Interaction::parse(p) else {
+            panic!()
+        };
+        assert_eq!(v.team_id.as_deref(), Some("T9"));
         // Missing fields.
         assert_eq!(Interaction::parse(json!({"type": "view_submission"})), None);
         assert_eq!(Interaction::parse(json!({"type": "block_actions"})), None);

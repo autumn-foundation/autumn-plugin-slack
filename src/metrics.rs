@@ -34,6 +34,7 @@ type Pair = (&'static str, &'static str);
 pub struct SlackMetrics {
     requests: Mutex<BTreeMap<Pair, u64>>,
     handlers: Mutex<BTreeMap<Pair, u64>>,
+    late: Mutex<BTreeMap<&'static str, u64>>,
     api: Mutex<BTreeMap<(String, &'static str), u64>>,
     retries: Mutex<BTreeMap<String, u64>>,
     in_flight: AtomicU64,
@@ -58,6 +59,11 @@ impl SlackMetrics {
             .or_default() += 1;
     }
 
+    /// A handler that missed the ack. Its run also counts in `handler`.
+    pub(crate) fn late_ack(&self, surface: Surface) {
+        *lock(&self.late).entry(surface.as_str()).or_default() += 1;
+    }
+
     pub(crate) fn api_call(&self, method: &str, outcome: &'static str) {
         *lock(&self.api)
             .entry((method.to_owned(), outcome))
@@ -70,7 +76,7 @@ impl SlackMetrics {
 
     pub(crate) fn in_flight_add(&self, delta: i64) {
         let step = delta.unsigned_abs();
-        // Saturate at 0: a stray decrement must not wrap.
+        // Saturate at 0: an extra decrement must not wrap below 0.
         let _ = self
             .in_flight
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
@@ -82,16 +88,23 @@ impl SlackMetrics {
             });
     }
 
-    /// Requests by route (`events`, `commands`, `interactions`) and outcome.
+    /// Requests by surface (`events`, `commands`, `interactions`) and outcome.
     #[must_use]
     pub fn requests(&self, surface: &str, outcome: &str) -> u64 {
         get(&lock(&self.requests), surface, outcome)
     }
 
-    /// Handler runs by route and outcome (`ok`, `error`, `panic`, `late`).
+    /// Handler runs by surface and outcome (`ok`, `error`, `panic`). Each run
+    /// counts once.
     #[must_use]
     pub fn handler_runs(&self, surface: &str, outcome: &str) -> u64 {
         get(&lock(&self.handlers), surface, outcome)
+    }
+
+    /// Handlers that missed the ack, by surface.
+    #[must_use]
+    pub fn late_acks(&self, surface: &str) -> u64 {
+        lock(&self.late).get(surface).copied().unwrap_or(0)
     }
 
     /// Web API calls by method and outcome.
@@ -166,6 +179,13 @@ impl MetricsSource for SlackMetrics {
                 value: as_f64(*n),
             })
             .collect();
+        let late = lock(&self.late)
+            .iter()
+            .map(|(s, n)| MetricSample {
+                labels: labels(&[("surface", s)]),
+                value: as_f64(*n),
+            })
+            .collect();
         let retries = lock(&self.retries)
             .iter()
             .map(|(m, n)| MetricSample {
@@ -176,15 +196,21 @@ impl MetricsSource for SlackMetrics {
         vec![
             family(
                 "slack_requests_total",
-                "Inbound Slack requests by route and outcome.",
+                "Inbound Slack requests by surface and outcome.",
                 MetricKind::Counter,
                 requests,
             ),
             family(
                 "slack_handler_runs_total",
-                "Handler runs by route and outcome.",
+                "Handler runs by surface and outcome.",
                 MetricKind::Counter,
                 handlers,
+            ),
+            family(
+                "slack_late_acks_total",
+                "Handlers that missed the ack, by surface.",
+                MetricKind::Counter,
+                late,
             ),
             family(
                 "slack_api_calls_total",
@@ -220,14 +246,17 @@ mod tests {
         let m = SlackMetrics::new();
         m.request(Surface::Events, "ok");
         m.request(Surface::Events, "ok");
-        m.handler(Surface::Commands, "late");
+        m.handler(Surface::Commands, "ok");
+        m.late_ack(Surface::Commands);
         m.api_call("chat.postMessage", "ok");
         m.api_retry("chat.postMessage");
         m.in_flight_add(2);
         m.in_flight_add(-1);
         assert_eq!(m.requests("events", "ok"), 2);
         assert_eq!(m.requests("events", "bad_signature"), 0);
-        assert_eq!(m.handler_runs("commands", "late"), 1);
+        assert_eq!(m.handler_runs("commands", "ok"), 1);
+        assert_eq!(m.late_acks("commands"), 1);
+        assert_eq!(m.late_acks("events"), 0);
         assert_eq!(m.api_calls("chat.postMessage", "ok"), 1);
         assert_eq!(m.api_retries("chat.postMessage"), 1);
         assert_eq!(m.in_flight(), 1);
