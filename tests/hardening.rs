@@ -75,8 +75,9 @@ async fn every_route_rejects_bad_signatures_before_any_handler() {
             .await;
         r.assert_status(400);
     }
-    tokio::time::sleep(Duration::from_millis(50)).await;
     for s in ["events", "commands", "interactions"] {
+        // Set before a handler task starts: no wait needed.
+        assert_eq!(metrics.requests(s, "ok"), 0, "{s}: a request passed");
         assert_eq!(metrics.requests(s, "bad_signature"), 1, "{s}");
         assert_eq!(metrics.requests(s, "stale"), 1, "{s}");
         assert_eq!(metrics.requests(s, "bad_request"), 1, "{s}");
@@ -188,13 +189,15 @@ async fn late_ack_counts_once_and_late_ack_reply_posts_nothing() {
     let t = MemoryTransport::new();
     let gate = Gate::default();
     let g = gate.clone();
-    let p = plugin_with(&t, slow_config()).command("/quiet", move |_c, _cmd| {
-        let g = g.clone();
-        async move {
-            g.wait().await;
-            Ok(CommandResponse::Ack)
-        }
-    });
+    let p = plugin_with(&t, slow_config())
+        .command("/quiet", move |_c, _cmd| {
+            let g = g.clone();
+            async move {
+                g.wait().await;
+                Ok(CommandResponse::Ack)
+            }
+        })
+        .command("/fast", |_c, _cmd| async { Ok(CommandResponse::Ack) });
     let metrics = p.metrics();
     let client = TestApp::new().plugin(p).build();
     let r = within(post_form(
@@ -218,6 +221,15 @@ async fn late_ack_counts_once_and_late_ack_reply_posts_nothing() {
         t.requests_to(RESPONSE_URL).is_empty(),
         "a late Ack posts nothing"
     );
+    // The count stays at 1. A command that ends in time adds no late ack.
+    post_form(&client, "/slack/commands", &command_form("/fast", ""))
+        .await
+        .assert_status(200);
+    wait_until(Duration::from_secs(5), &|| {
+        metrics.handler_runs("commands", "ok") == 2
+    })
+    .await;
+    assert_eq!(metrics.late_acks("commands"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -338,6 +350,18 @@ async fn trigger_calls_do_not_wait_past_the_trigger_life() {
         "{e:?}"
     );
     assert_eq!(t.requests_to("views.open").len(), 1);
+    // With a short wait: one retry only, then stop.
+    t.respond(
+        "views.push",
+        HttpReply::json(429, &json!({"ok": false})).retry_after(1),
+    );
+    let e = rt
+        .client()
+        .views_push("trig", &json!({}))
+        .await
+        .unwrap_err();
+    assert!(matches!(e, SlackError::RateLimited { .. }), "{e:?}");
+    assert_eq!(t.requests_to("views.push").len(), 2);
 }
 
 // ----------------------------------------------------- autumn review

@@ -7,7 +7,7 @@
 
 All Slack Web API calls are HTTP `POST`. Slack replies 429 with
 `Retry-After` when an app sends too many calls. A 429 means Slack did not
-do the call. After a 5xx or a connection failure, Slack possibly did the call.
+do the call. After a 5xx or a connection failure, it is possible that Slack did the call.
 
 autumn-web 0.8 has `http_client::Client`. By default it retries only
 idempotent HTTP methods. It does not retry `POST`.
@@ -57,8 +57,8 @@ Slack must get a reply in 3 s.
 
 ## Retry budget
 
-The longest call is about `max_attempts × timeout_ms + (max_attempts − 1) ×
-max_wait_ms` (default about 90 s). This is longer than the drain. Shutdown
-can stop a call that waits for a retry. Calls with a `trigger_id` wait 1 s
-or less, because the trigger is valid for 3 s only. The health check makes
-one attempt.
+The maximum time for one call is approximately `max_attempts × timeout_ms +
+(max_attempts − 1) × max_wait_ms` (default 90 s). This is longer than the
+drain. Shutdown can stop a call that waits for a retry. A call with a
+`trigger_id` retries one time only and waits 1 s or less, because the
+trigger is valid for 3 s only. The health check makes one attempt.

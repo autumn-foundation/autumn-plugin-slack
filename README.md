@@ -172,8 +172,8 @@ can use it.
 - After a 429, the client waits for the `Retry-After` time (1 s if there is
   no header). If the wait is more than `api.max_wait_ms`, or no attempts
   remain, the call stops with `SlackError::RateLimited`.
-- `views_open` and `views_push` wait 1 s or less, because a `trigger_id`
-  is valid for 3 s only.
+- `views_open` and `views_push` retry one time only, and wait 1 s or less
+  before the retry, because a `trigger_id` is valid for 3 s only.
 - `ok: false` gives `SlackError::Api` with the Slack code.
 - `respond` posts to a `response_url` only on an allowed host (default
   `hooks.slack.com`) over HTTPS. It sends no token.
@@ -182,8 +182,8 @@ can use it.
 
 `[slack]` in `autumn.toml`. A profile file (for example `autumn-prod.toml`)
 and `AUTUMN_SLACK__*` env vars override it. In an env var, put a comma
-between list items. The plugin does not read `[profile.<name>.slack]`: with
-`strict_config`, autumn stops at boot on that section.
+between list items. The plugin does not read `[profile.<name>.slack]`. With
+`strict_config`, autumn stops at startup when it finds that section.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -203,7 +203,7 @@ between list items. The plugin does not read `[profile.<name>.slack]`: with
 | `api.initial_backoff_ms` | `500` | First backoff for read retries. |
 | `api.max_wait_ms` | `30000` | Maximum wait before a retry. |
 | `api.timeout_ms` | `10000` | Time limit for each HTTP attempt. |
-| `health.cache_secs` | `30` | Time to keep an `Up` result. |
+| `health.cache_secs` | `30` | Time to keep an `Up` result. A `Down` result stays 5 s or less. |
 
 The plugin ignores an empty signing secret. A secret must come from an env
 var or from a builder call.
@@ -215,14 +215,15 @@ Constructors: `SlackPlugin::new()` (reads `[slack]`) and
 
 ## Operations
 
-- **Health:** `slack` on `/actuator/health`. It calls `auth.test` once. It
-  keeps `Up` for `health.cache_secs` and `Down` for 5 s or less. One check
-  runs at a time. `readiness(true)` also puts it in `/ready`. Details give a
+- **Health:** `slack` on `/actuator/health`. Each check makes one
+  `auth.test` attempt. It does not retry. It keeps `Up` for
+  `health.cache_secs` and `Down` for 5 s or less. One check runs at a time.
+  Other probes get the result of that check. `readiness(true)` also puts it in `/ready`. Details give a
   short error code only.
 - **Metrics** on `/actuator/prometheus`:
   - `slack_requests_total{surface,outcome}`
   - `slack_handler_runs_total{surface,outcome}` (each run counts once)
-  - `slack_late_acks_total{surface}` (handlers that missed the ack)
+  - `slack_late_acks_total{surface}` (handlers that did not end before the ack)
   - `slack_api_calls_total{method,outcome}`
   - `slack_api_retries_total{method}`
   - `slack_handlers_in_flight`
@@ -264,7 +265,8 @@ client.post("/slack/events").header(h1, &v1).header(h2, &v2).body(body).send().a
 assert_eq!(t.requests_to("chat.postMessage").len(), 1);
 ```
 
-`MemoryTransport::set_latency` makes replies slow, to test timeouts.
+Use `MemoryTransport::set_latency` to make replies slow. Use it to test the
+ack window and the health time limit.
 
 ## Not in scope
 

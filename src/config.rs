@@ -129,7 +129,7 @@ impl ApiConfig {
 #[serde(default, deny_unknown_fields)]
 #[non_exhaustive]
 pub struct HealthConfig {
-    /// Time to keep an `auth.test` result.
+    /// Time to keep an `Up` result. A `Down` result stays 5 s or less.
     pub cache_secs: u64,
 }
 

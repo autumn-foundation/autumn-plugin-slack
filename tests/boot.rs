@@ -53,6 +53,8 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         l.local_addr().unwrap().port()
     };
+    let dir = std::env::temp_dir().join(format!("slack-boot-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
     let mut child = KillOnDrop(
         Command::new(std::env::current_exe().unwrap())
             .args([
@@ -61,6 +63,12 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
                 "--include-ignored",
                 "--nocapture",
             ])
+            // A clean env and an empty dir: a developer's AUTUMN_* vars,
+            // `.env`, or `autumn.toml` cannot change the result.
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("AUTUMN_MANIFEST_DIR", &dir)
+            .current_dir(&dir)
             .env(CHILD_MARK, "1")
             .env("AUTUMN_SERVER__PORT", port.to_string())
             .env("AUTUMN_SERVER__HOST", "127.0.0.1")

@@ -291,7 +291,7 @@ pub fn retry_after_ms(secs: u64) -> (r: u64)
 
 /// One step of the client loop: a retry at `attempt < max` gives a next
 /// attempt that is still `<= max`. The loop itself (start at 1, add 1 per
-/// retry) is in `src/client.rs`, outside this spec; tests check it.
+/// retry) is in `src/client.rs`. This spec does not include it. Tests check it.
 proof fn lemma_attempts_bounded(attempt: u32, max_attempts: u32)
     requires
         attempt < max_attempts,

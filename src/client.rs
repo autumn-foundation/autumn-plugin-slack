@@ -13,9 +13,11 @@ use crate::payload::Message;
 use crate::policy::{Outcome, RetryRule, Step, decide, retry_after_ms};
 use crate::transport::{HttpReply, HttpRequest, HttpTransport, TransportError};
 
-/// Largest 429 wait for a call with a `trigger_id`. A trigger is valid for
+/// Maximum 429 wait for a call with a `trigger_id`. A trigger is valid for
 /// 3 s only, so a longer wait gives `expired_trigger_id`.
 const TRIGGER_MAX_WAIT_MS: u64 = 1_000;
+/// Maximum attempts for a call with a `trigger_id`: one retry fits in 3 s.
+const TRIGGER_MAX_ATTEMPTS: u32 = 2;
 
 /// Metrics label for `response_url` posts.
 const RESPONSE_URL_LABEL: &str = "response_url";
@@ -130,10 +132,11 @@ impl SlackClient {
         self.inner.config.api.rule()
     }
 
-    /// The rule for calls with a `trigger_id`: a short wait cap.
+    /// The rule for calls with a `trigger_id`: one short retry at most.
     fn trigger_rule(&self) -> RetryRule {
         let mut r = self.rule();
         r.max_wait_ms = r.max_wait_ms.min(TRIGGER_MAX_WAIT_MS);
+        r.max_attempts = r.max_attempts.min(TRIGGER_MAX_ATTEMPTS);
         r
     }
 

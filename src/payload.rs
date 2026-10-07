@@ -402,7 +402,7 @@ pub(crate) enum Interaction {
     ViewSubmission(ViewPayload),
     ViewClosed(ViewPayload),
     Shortcut(Shortcut),
-    /// `block_suggestion`: options load. Not in scope; the reply is no options.
+    /// `block_suggestion`: options load. Not in scope. The reply has no options.
     BlockSuggestion,
     /// A type with no support.
     Other,

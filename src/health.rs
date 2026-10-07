@@ -33,7 +33,7 @@ struct Entry {
 /// - `Unknown`: before start, or with no bot token.
 ///
 /// It keeps `Up` for `[slack.health] cache_secs` and `Down` for 5 s or less.
-/// One check runs at a time; other probes get its result. Details give a
+/// One check runs at a time. Other probes get the result of that check. Details give a
 /// short error code only.
 pub struct SlackHealth {
     client: OnceLock<SlackClient>,

@@ -23,7 +23,10 @@ pub const fn backoff_ms(initial: u64, attempt: u32, cap: u64) -> u64 {
     let mut i = 1;
     while i < attempt {
         // At the cap or at zero: stop early. A large `attempt` costs no time.
-        if b == cap || b == 0 {
+        if b == cap {
+            return b;
+        }
+        if b == 0 {
             return b;
         }
         // Compare without overflow: `cap - b <= b` is `2b >= cap`.
@@ -301,6 +304,15 @@ mod tests {
         fn fresh_is_symmetric(a: u64, b: u64, t: u64) {
             prop_assert_eq!(timestamp_fresh(a, b, t), timestamp_fresh(b, a, t));
             prop_assert_eq!(timestamp_fresh(a, b, t), a.abs_diff(b) <= t);
+        }
+
+        /// Same value as the Verus `spec_backoff`, from an independent
+        /// formula: `min(initial * 2^(attempt - 1), cap)`, in `u128`.
+        #[test]
+        fn backoff_matches_closed_form(init: u64, n in 0u32..200, cap: u64) {
+            let exp = n.saturating_sub(1).min(64);
+            let want = (u128::from(init) << exp).min(u128::from(cap));
+            prop_assert_eq!(u128::from(backoff_ms(init, n, cap)), want);
         }
 
         #[test]
