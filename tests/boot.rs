@@ -1,7 +1,8 @@
 //! Boots a real app (not `TestApp`) with only the Slack plugin.
 //!
-//! Regression: autumn refuses to start with no `Route`. The plugin must give
-//! real routes, not only a nested router.
+//! Regressions: autumn refuses to start with no `Route`, so the plugin must
+//! give real routes. A `#[job]` must get the client, so the plugin must start
+//! before job workers.
 //!
 //! The test runs this test binary again as a child process, with the env
 //! vars set. So it changes no env in this process.
@@ -10,7 +11,7 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use autumn_plugin_slack::{SlackPlugin, testing};
+use autumn_plugin_slack::{SlackClient, SlackPlugin, testing};
 
 const SECRET: &str = "boot-test-secret";
 const OLD_SECRET: &str = "boot-test-old-secret";
@@ -23,7 +24,18 @@ async fn boot_child_server() {
     if std::env::var(CHILD_MARK).is_err() {
         return;
     }
-    autumn_web::app().plugin(SlackPlugin::new()).run().await;
+    autumn_web::app()
+        .plugin(SlackPlugin::new())
+        // autumn runs state initializers before job workers and startup
+        // hooks. The client must be ready here, so a `#[job]` can use it.
+        .state_initializer(|state| {
+            if SlackClient::from_state(state).is_none() {
+                eprintln!("no SlackClient before job workers start");
+                std::process::exit(3);
+            }
+        })
+        .run()
+        .await;
 }
 
 struct KillOnDrop(Child);

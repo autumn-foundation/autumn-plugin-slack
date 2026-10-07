@@ -549,22 +549,3 @@ async fn ssl_check_has_its_own_label() {
     assert_eq!(metrics.requests("commands", "ssl_check"), 1);
     assert_eq!(metrics.requests("commands", "ok"), 0);
 }
-
-#[test]
-fn client_is_ready_before_jobs_start() {
-    // autumn runs state initializers before job workers. An initializer
-    // after the plugin sees the client, so a `#[job]` sees it too.
-    let t = MemoryTransport::new();
-    let seen = Arc::new(AtomicBool::new(false));
-    let s = Arc::clone(&seen);
-    let _client = TestApp::new()
-        .plugin(plugin(&t))
-        .state_initializer(move |state| {
-            s.store(
-                autumn_plugin_slack::SlackClient::from_state(state).is_some(),
-                Ordering::SeqCst,
-            );
-        })
-        .build();
-    assert!(seen.load(Ordering::SeqCst));
-}
