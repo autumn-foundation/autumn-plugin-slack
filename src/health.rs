@@ -21,6 +21,7 @@ pub const DOWN_TTL: Duration = Duration::from_secs(5);
 /// A stored result and its expiry.
 #[derive(Clone)]
 struct Entry {
+    stored: Instant,
     until: Instant,
     out: HealthCheckOutput,
 }
@@ -69,13 +70,23 @@ impl SlackHealth {
         let _ = self.client.set(client);
     }
 
-    fn cached(&self) -> Option<HealthCheckOutput> {
-        let entry = self
-            .cache
+    fn entry(&self) -> Option<Entry> {
+        self.cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()?;
+            .clone()
+    }
+
+    fn cached(&self) -> Option<HealthCheckOutput> {
+        let entry = self.entry()?;
         (Instant::now() < entry.until).then_some(entry.out)
+    }
+
+    /// A result stored at or after `since`, whatever its TTL. A probe that
+    /// waited for another check uses that check's result.
+    fn stored_since(&self, since: Instant) -> Option<HealthCheckOutput> {
+        let entry = self.entry()?;
+        (entry.stored >= since).then_some(entry.out)
     }
 
     fn store(&self, out: &HealthCheckOutput) {
@@ -89,6 +100,7 @@ impl SlackHealth {
             .cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Entry {
+            stored: Instant::now(),
             until: Instant::now() + ttl,
             out: out.clone(),
         });
@@ -145,9 +157,11 @@ impl HealthIndicator for SlackHealth {
             if let Some(out) = self.cached() {
                 return out;
             }
-            // Single flight: a probe that waits here gets the new result.
+            // Single flight: a probe that waits here gets the new result,
+            // also with `cache_secs = 0`.
+            let since = Instant::now();
             let _turn = self.refresh.lock().await;
-            if let Some(out) = self.cached() {
+            if let Some(out) = self.cached().or_else(|| self.stored_since(since)) {
                 return out;
             }
             let out = Self::run_check(client).await;

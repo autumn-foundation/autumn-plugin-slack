@@ -479,3 +479,92 @@ async fn handler_panic_and_error_are_counted() {
     .await;
     assert_eq!(metrics.in_flight(), 0);
 }
+
+// ------------------------------------------------------ round 2 review
+
+#[tokio::test]
+async fn single_flight_holds_with_zero_cache_time() {
+    let t = MemoryTransport::new();
+    t.respond(
+        "auth.test",
+        HttpReply::json(200, &json!({"ok": true, "team_id": "T", "user_id": "U"})),
+    );
+    t.set_latency(Duration::from_millis(50));
+    let mut c = config();
+    c.health.cache_secs = 0;
+    let rt = plugin_with(&t, c).start(&AppState::for_test()).unwrap();
+    let h = rt.health();
+    let outs = futures::future::join_all((0..10).map(|_| h.check())).await;
+    assert!(outs.iter().all(|o| o.status == HealthStatus::Up));
+    assert_eq!(
+        t.requests_to("auth.test").len(),
+        1,
+        "waiters share one check"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_ack_counts_while_the_handler_still_runs() {
+    let t = MemoryTransport::new();
+    let gate = Gate::default();
+    let g = gate.clone();
+    let p = plugin_with(&t, slow_config()).command("/hang", move |_c, _cmd| {
+        let g = g.clone();
+        async move {
+            g.wait().await;
+            Ok(CommandResponse::Ack)
+        }
+    });
+    let metrics = p.metrics();
+    let client = TestApp::new().plugin(p).build();
+    within(post_form(
+        &client,
+        "/slack/commands",
+        &command_form("/hang", ""),
+    ))
+    .await
+    .assert_status(200);
+    // The handler still waits on the gate. The metric shows the late ack now.
+    wait_until(Duration::from_secs(5), &|| {
+        metrics.late_acks("commands") == 1
+    })
+    .await;
+    assert_eq!(metrics.in_flight(), 1);
+    gate.open();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ssl_check_has_its_own_label() {
+    let t = MemoryTransport::new();
+    let p = plugin(&t);
+    let metrics = p.metrics();
+    let client = TestApp::new().plugin(p).build();
+    client
+        .post("/slack/commands")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("token=x&ssl_check=1")
+        .send()
+        .await
+        .assert_status(200);
+    assert_eq!(metrics.requests("commands", "ssl_check"), 1);
+    assert_eq!(metrics.requests("commands", "ok"), 0);
+}
+
+#[test]
+fn client_is_ready_before_jobs_start() {
+    // autumn runs state initializers before job workers. An initializer
+    // after the plugin sees the client, so a `#[job]` sees it too.
+    let t = MemoryTransport::new();
+    let seen = Arc::new(AtomicBool::new(false));
+    let s = Arc::clone(&seen);
+    let _client = TestApp::new()
+        .plugin(plugin(&t))
+        .state_initializer(move |state| {
+            s.store(
+                autumn_plugin_slack::SlackClient::from_state(state).is_some(),
+                Ordering::SeqCst,
+            );
+        })
+        .build();
+    assert!(seen.load(Ordering::SeqCst));
+}

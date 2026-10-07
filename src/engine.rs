@@ -167,11 +167,10 @@ impl Engine {
     pub(crate) async fn commands(&self, headers: &HeaderMap, body: Bytes) -> Response {
         const S: Surface = Surface::Commands;
         // Slack can send `ssl_check` with no signature. The reply is a fixed
-        // empty 200 and no handler runs, so it is safe before the check.
-        let form: BTreeMap<String, String> =
-            serde_urlencoded::from_bytes(&body).unwrap_or_default();
-        if form.get("ssl_check").map(String::as_str) == Some("1") {
-            self.metrics.request(S, "ok");
+        // empty 200 and no handler runs, so it is safe before the check. The
+        // scan keeps no pairs, so an unsigned body costs no extra memory.
+        if url::form_urlencoded::parse(&body).any(|(k, v)| k == "ssl_check" && v == "1") {
+            self.metrics.request(S, "ssl_check");
             return ok();
         }
         if let Some(r) = self.check(S, headers, &body) {
@@ -230,14 +229,15 @@ impl Engine {
             let res = if let Ok(done) = tokio::time::timeout(ack, &mut handle).await {
                 match tx.send(finished_ok(done)) {
                     Ok(()) => return,
-                    // The request is gone. Use the late path.
+                    // The request is gone: the ack is not late. Use the late path.
                     Err(res) => res,
                 }
             } else {
+                // Count now: a handler that never ends must still show.
+                metrics.late_ack(surface);
                 drop(tx);
                 finished_ok(handle.await)
             };
-            metrics.late_ack(surface);
             late(res).await;
         });
         rx
@@ -295,7 +295,7 @@ impl Engine {
                 };
                 self.metrics.request(S, "ok");
                 let rx = self.ack_or_late(S, Arc::clone(handler), view, |_| async {
-                    tracing::warn!("slack view_submission handler missed the ack; the view closed");
+                    tracing::warn!("slack view_submission reply lost: the ack went out first");
                 });
                 // An empty 200 closes the view. No error detail goes to Slack.
                 rx.await

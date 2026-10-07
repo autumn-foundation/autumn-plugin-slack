@@ -562,6 +562,8 @@ impl Plugin for SlackPlugin {
                         let _ = init_cell.set(rt.engine);
                     }
                     Err(e) => {
+                        // Also log: some autumn modes run no startup hook.
+                        tracing::error!(error = %e, "slack plugin did not start");
                         *init_failure
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
