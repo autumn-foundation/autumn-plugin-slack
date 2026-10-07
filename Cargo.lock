@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "autumn-plugin-slack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "autumn-web",
  "futures",
