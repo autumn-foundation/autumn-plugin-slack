@@ -24,18 +24,20 @@ async fn boot_child_server() {
     if std::env::var(CHILD_MARK).is_err() {
         return;
     }
-    autumn_web::app()
-        .plugin(SlackPlugin::new())
-        // autumn runs state initializers before job workers and startup
-        // hooks. The client must be ready here, so a `#[job]` can use it.
-        .state_initializer(|state| {
-            if SlackClient::from_state(state).is_none() {
-                eprintln!("no SlackClient before job workers start");
-                std::process::exit(3);
-            }
-        })
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .plugin(SlackPlugin::new())
+            // autumn runs state initializers before job workers and startup
+            // hooks. The client must be ready here, so a `#[job]` can use it.
+            .state_initializer(|state| {
+                if SlackClient::from_state(state).is_none() {
+                    eprintln!("no SlackClient before job workers start");
+                    std::process::exit(3);
+                }
+            })
+            .run(),
+    )
+    .await;
 }
 
 struct KillOnDrop(Child);

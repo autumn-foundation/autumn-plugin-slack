@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Slack plugin for autumn-web 0.8. Style for all docs and comments: ASD-STE100.
+Slack plugin for autumn-web 0.9. Style for all docs and comments: ASD-STE100.
 
 ## Layout
 

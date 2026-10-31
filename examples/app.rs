@@ -110,16 +110,18 @@ async fn save_notes(_ctx: SlackContext, view: ViewPayload) -> HandlerResult<View
 
 #[autumn_web::main]
 async fn main() {
-    autumn_web::app()
-        .plugin(
-            SlackPlugin::new()
-                .on_event("app_mention", on_mention)
-                .on_event("app_home_opened", on_home_opened)
-                .command("/deploy", deploy)
-                .action("approve_deploy", approve)
-                .action("open_notes", open_notes)
-                .view_submission("deploy_notes", save_notes),
-        )
-        .run()
-        .await;
+    Box::pin(
+        autumn_web::app()
+            .plugin(
+                SlackPlugin::new()
+                    .on_event("app_mention", on_mention)
+                    .on_event("app_home_opened", on_home_opened)
+                    .command("/deploy", deploy)
+                    .action("approve_deploy", approve)
+                    .action("open_notes", open_notes)
+                    .view_submission("deploy_notes", save_notes),
+            )
+            .run(),
+    )
+    .await;
 }
