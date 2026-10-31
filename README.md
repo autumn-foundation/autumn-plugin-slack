@@ -1,6 +1,6 @@
 # autumn-plugin-slack
 
-Slack plugin for [autumn-web](https://autumn-web.app) 0.8.
+Slack plugin for [autumn-web](https://autumn-web.app) 0.9.
 
 - Signature-checked Slack routes: Events API, slash commands, and interactivity.
 - Typed handlers by event type, command, `action_id`, or `callback_id`.

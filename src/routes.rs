@@ -84,6 +84,7 @@ pub(crate) fn autumn_routes(cell: &EngineCell, base: &str) -> Vec<Route> {
                 idempotency: autumn_web::RouteIdempotency::default(),
                 timeout: autumn_web::RouteTimeout::default(),
                 seo: autumn_web::seo::SeoRouteDefaults::default(),
+                criticality: autumn_web::Criticality::default(),
             }
         })
         .collect()
@@ -142,6 +143,18 @@ pub(crate) fn json(value: &serde_json::Value) -> Response {
 mod tests {
     use super::*;
     use tower::ServiceExt as _;
+
+    #[test]
+    fn autumn_routes_use_the_default_criticality() {
+        let cell: EngineCell = Arc::new(OnceLock::new());
+        let routes = autumn_routes(&cell, "/hooks");
+        assert_eq!(routes.len(), PATHS.len());
+        for route in &routes {
+            assert_eq!(route.criticality, autumn_web::Criticality::Default);
+            assert!(route.api_doc.hidden);
+            assert!(route.api_doc.public);
+        }
+    }
 
     #[tokio::test]
     async fn unstarted_routes_reply_503() {
