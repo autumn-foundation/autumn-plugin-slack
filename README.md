@@ -12,7 +12,7 @@ Slack plugin for [autumn-web](https://autumn-web.app) 0.9.
 
 ```toml
 [dependencies]
-autumn-plugin-slack = "0.1"
+autumn-plugin-slack = "0.3"
 ```
 
 ```rust,ignore
