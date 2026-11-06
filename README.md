@@ -15,7 +15,7 @@ Slack plugin for [autumn-web](https://autumn-web.app) 0.10.
 autumn-plugin-slack = "0.4"
 ```
 
-```rust,ignore
+```rust,no_run
 use autumn_plugin_slack::payload::{CommandResponse, EventCallback, Message, MessageEvent, SlashCommand};
 use autumn_plugin_slack::{HandlerResult, SlackContext, SlackPlugin};
 
@@ -135,11 +135,16 @@ The default dedup store is in memory, for one process. For many replicas,
 use a shared store. autumn's Redis store needs the autumn-web `redis`
 feature:
 
-```rust,ignore
-use autumn_web::webhook::{RedisWebhookReplayStore, WebhookReplayRedisConfig};
+```rust
+use std::sync::Arc;
+use autumn_plugin_slack::SlackPlugin;
+use autumn_web::webhook::WebhookReplayStore;
 
-let redis: WebhookReplayRedisConfig = /* from your config */;
-SlackPlugin::new().with_replay_store(Arc::new(RedisWebhookReplayStore::from_config(&redis)?))
+// For example `RedisWebhookReplayStore::from_config(&redis)?`, with the
+// autumn-web `redis` feature.
+fn plugin(shared: Arc<dyn WebhookReplayStore>) -> SlackPlugin {
+    SlackPlugin::new().with_replay_store(shared)
+}
 ```
 
 A restart stops background handlers. Use a `#[job]` for work that must
@@ -152,12 +157,21 @@ no options and no error.
 
 ## Web API client
 
-```rust,ignore
-let c = ctx.client();
-c.chat_post_message("C123", &Message::text("Hello").blocks(blocks)).await?;
-c.views_open(&trigger_id, &modal).await?;
-let users = c.paginate("users.list", &json!({"limit": 200}), "members", 10).await?;
-let any = c.call("pins.add", &json!({"channel": "C123", "timestamp": ts})).await?;
+```rust,no_run
+use autumn_plugin_slack::payload::Message;
+use autumn_plugin_slack::{SlackContext, SlackError};
+use serde_json::{Value, json};
+
+async fn demo(ctx: SlackContext, trigger_id: String, modal: Value, ts: String) -> Result<(), SlackError> {
+    let blocks = vec![json!({"type": "section", "text": {"type": "mrkdwn", "text": "*Hi*"}})];
+    let c = ctx.client();
+    c.chat_post_message("C123", &Message::text("Hello").blocks(blocks)).await?;
+    c.views_open(&trigger_id, &modal).await?;
+    let users = c.paginate("users.list", &json!({"limit": 200}), "members", 10).await?;
+    let any = c.call("pins.add", &json!({"channel": "C123", "timestamp": ts})).await?;
+    let _ = (users, any);
+    Ok(())
+}
 ```
 
 Outside a handler, `SlackClient::from_state(&state)` gives
@@ -238,31 +252,41 @@ Constructors: `SlackPlugin::new()` (reads `[slack]`) and
 
 ## Test your app
 
-```rust,ignore
-use autumn_plugin_slack::testing;
+```rust,no_run
+use autumn_plugin_slack::payload::EventCallback;
 use autumn_plugin_slack::transport::{HttpReply, MemoryTransport};
+use autumn_plugin_slack::{HandlerResult, SlackContext, SlackPlugin, testing};
 use autumn_web::test::TestApp;
 use serde_json::json;
 
-let t = MemoryTransport::new();
-t.respond(
-    "chat.postMessage",
-    HttpReply::json(200, &json!({"ok": true, "channel": "C1", "ts": "1.0"})),
-);
-let plugin = SlackPlugin::new()
-    .on_event("app_mention", on_mention)
-    .with_signing_secret("s")
-    .with_bot_token("xoxb-t")
-    .with_transport(t.clone());
-let client = TestApp::new().plugin(plugin).build();
+async fn on_mention(_ctx: SlackContext, _ev: EventCallback) -> HandlerResult<()> {
+    Ok(())
+}
 
-let body = json!({"type": "event_callback", "event_id": "E1",
-    "event": {"type": "app_mention", "channel": "C1", "ts": "1.0"}}).to_string();
-let now = /* the time now, in Unix seconds */;
-let [(h1, v1), (h2, v2)] = testing::signed_headers("s", now, body.as_bytes());
-client.post("/slack/events").header(h1, &v1).header(h2, &v2).body(body).send().await;
-// The handler runs after the ack. Wait for its call, then check it.
-assert_eq!(t.requests_to("chat.postMessage").len(), 1);
+#[tokio::main]
+async fn main() {
+    let t = MemoryTransport::new();
+    t.respond(
+        "chat.postMessage",
+        HttpReply::json(200, &json!({"ok": true, "channel": "C1", "ts": "1.0"})),
+    );
+    let plugin = SlackPlugin::new()
+        .on_event("app_mention", on_mention)
+        .with_signing_secret("s")
+        .with_bot_token("xoxb-t")
+        .with_transport(t.clone());
+    let client = TestApp::new().plugin(plugin).build();
+
+    let body = json!({"type": "event_callback", "event_id": "E1",
+        "event": {"type": "app_mention", "channel": "C1", "ts": "1.0"}}).to_string();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let [(h1, v1), (h2, v2)] = testing::signed_headers("s", now, body.as_bytes());
+    client.post("/slack/events").header(h1, &v1).header(h2, &v2).body(body).send().await;
+    // The handler runs after the ack. Wait for its call, then check it.
+    assert_eq!(t.requests_to("chat.postMessage").len(), 1);
+}
 ```
 
 Use `MemoryTransport::set_latency` to make replies slow. Use it to test the

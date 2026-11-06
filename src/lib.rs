@@ -31,3 +31,8 @@ pub use health::SlackHealth;
 pub use metrics::SlackMetrics;
 pub use plugin::{DEFAULT_BASE_PATH, PLUGIN_NAME, SlackPlugin, SlackRuntime};
 pub use verify::{SIGNATURE_HEADER, TIMESTAMP_HEADER, Verifier, VerifyError};
+
+/// Compiles the Rust snippets of the README as doctests.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;
