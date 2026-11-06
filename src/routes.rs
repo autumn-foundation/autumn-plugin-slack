@@ -85,6 +85,8 @@ pub(crate) fn autumn_routes(cell: &EngineCell, base: &str) -> Vec<Route> {
                 timeout: autumn_web::RouteTimeout::default(),
                 seo: autumn_web::seo::SeoRouteDefaults::default(),
                 criticality: autumn_web::Criticality::default(),
+                // `None` puts the routes in the plugin route group.
+                group: None,
             }
         })
         .collect()
