@@ -74,7 +74,7 @@ fn plugin_name_contract_and_config_section() {
     assert_eq!(p.name(), "autumn-plugin-slack");
     assert!(format!("{p:?}").contains("SlackPlugin"));
     let contract = p.contract().unwrap();
-    assert!(format!("{contract:?}").contains("0.10"), "{contract:?}");
+    assert!(format!("{contract:?}").contains("0.11"), "{contract:?}");
     let app = autumn_web::app().plugin(SlackPlugin::default());
     assert!(app.has_plugin("autumn-plugin-slack"));
     assert!(app.has_config_section("slack"));
@@ -359,7 +359,7 @@ async fn shutdown_gives_up_after_drain_timeout() {
     c.drain_timeout_secs = 1;
     let rt = plugin_with(&t, c)
         .on_event("message", |_ctx, _ev| async move {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            tokio::time::sleep(Duration::from_mins(1)).await;
             Ok(())
         })
         .start(&AppState::for_test())

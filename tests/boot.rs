@@ -90,7 +90,7 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let url = format!("http://127.0.0.1:{port}/slack/events");
     let signed_post = |secret: &'static str| {
-        let ts = u64::try_from(autumn_web::reexports::chrono::Utc::now().timestamp()).unwrap();
+        let ts = u64::try_from(autumn_web::time::Timestamp::now().as_second()).unwrap();
         let [(h1, v1), (h2, v2)] = testing::signed_headers(secret, ts, body.as_bytes());
         client
             .post(&url)
@@ -111,7 +111,7 @@ async fn slack_only_app_boots_and_serves_signed_requests() {
             panic!("the app stopped at boot ({status}):\n{err}");
         }
         assert!(
-            start.elapsed() < Duration::from_secs(60),
+            start.elapsed() < Duration::from_mins(1),
             "the app did not answer"
         );
         if let Ok(res) = signed_post(SECRET).await {

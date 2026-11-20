@@ -60,7 +60,7 @@ impl Engine {
     }
 
     fn now_secs(&self) -> u64 {
-        u64::try_from(self.clock.now().timestamp()).unwrap_or(0)
+        u64::try_from(self.clock.now().as_second()).unwrap_or(0)
     }
 
     const fn ack_timeout(&self) -> Duration {
