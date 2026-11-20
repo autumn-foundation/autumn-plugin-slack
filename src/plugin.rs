@@ -538,7 +538,7 @@ impl Plugin for SlackPlugin {
         Some(
             PluginContract::new(env!("CARGO_PKG_NAME"))
                 .plugin_version(env!("CARGO_PKG_VERSION"))
-                .autumn_web("0.10"),
+                .autumn_web("0.11"),
         )
     }
 
